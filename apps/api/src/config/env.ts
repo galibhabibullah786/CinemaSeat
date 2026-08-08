@@ -56,6 +56,8 @@ const EnvSchema = z.object({
 
   SHUTDOWN_TIMEOUT_MS: z.coerce.number().int().positive().default(10_000),
 
+  HOLD_TTL_SECONDS: z.coerce.number().int().positive().default(600),
+
   /** Surfaced by /health so you can tell which build is actually running. */
   APP_VERSION: z.string().default('dev'),
 });

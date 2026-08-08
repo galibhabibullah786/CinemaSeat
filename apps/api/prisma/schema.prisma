@@ -12,7 +12,7 @@ generator client {
   // covers whichever platform the GENERATION ran on; without this list the
   // service crashes on first query with "could not locate the Query Engine
   // for runtime linux-musl-openssl-3.0.x".
-  binaryTargets = ["native", "linux-musl-openssl-3.0.x"]
+  binaryTargets = ["native", "linux-musl-arm64-openssl-3.0.x", "linux-musl-openssl-3.0.x"]
 
   // Explicit output, deliberately OUTSIDE src/ and dist/.
   //
@@ -37,23 +37,136 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-// >>> DEMO-DOMAIN:items -- removed by scripts/reset-domain.sh
-/// The disposable demo entity. Delete this model at the start of the hackathon.
-model Item {
-  id        String   @id @default(uuid()) @db.Uuid
-  name      String   @db.VarChar(200)
-  quantity  Int
-  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+model Movie {
+  id              String     @id @default(uuid())
+  title           String     @db.VarChar(200)
+  synopsis        String?    @db.Text
+  posterUrl       String?    @map("poster_url") @db.VarChar(500)
+  backdropUrl     String?    @map("backdrop_url") @db.VarChar(500)
+  durationMinutes Int        @map("duration_minutes")
+  certificate     String?    @db.VarChar(20)
+  genres          String[]   @default([])
+  createdAt       DateTime   @default(now()) @map("created_at") @db.Timestamptz(3)
 
-  // Keyset pagination reads (createdAt DESC, id DESC). The composite index
-  // matches the ORDER BY exactly, so Postgres can walk it instead of sorting.
-  // id is in the key to break ties deterministically -- two items created in
-  // the same millisecond would otherwise page unstably.
-  @@index([createdAt(sort: Desc), id(sort: Desc)])
-  @@map("items")
+  showtimes       Showtime[]
+
+  @@map("movies")
 }
 
-// <<< DEMO-DOMAIN:items
+model Theatre {
+  id        String     @id @default(uuid())
+  name      String     @db.VarChar(200)
+  location  String?    @db.VarChar(300)
+  createdAt DateTime   @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  screens   Screen[]
+  showtimes Showtime[]
+
+  @@map("theatres")
+}
+
+model Screen {
+  id        String     @id @default(uuid())
+  theatreId String     @map("theatre_id")
+  name      String     @db.VarChar(100)
+  capacity  Int
+  createdAt DateTime   @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  theatre   Theatre    @relation(fields: [theatreId], references: [id], onDelete: Cascade)
+  seats     Seat[]
+  showtimes Showtime[]
+
+  @@map("screens")
+}
+
+model Seat {
+  id          String          @id @default(uuid())
+  screenId    String          @map("screen_id")
+  rowLabel    String          @map("row_label") @db.VarChar(10)
+  seatNumber  Int             @map("seat_number")
+  seatClass   String          @default("Standard") @map("seat_class") @db.VarChar(50)
+  priceCents  Int             @map("price_cents")
+  createdAt   DateTime        @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  screen      Screen          @relation(fields: [screenId], references: [id], onDelete: Cascade)
+  inventories SeatInventory[]
+  bookingSeats BookingSeat[]
+
+  @@unique([screenId, rowLabel, seatNumber])
+  @@map("seats")
+}
+
+model Showtime {
+  id          String          @id @default(uuid())
+  movieId     String          @map("movie_id")
+  theatreId   String          @map("theatre_id")
+  screenId    String          @map("screen_id")
+  startsAt    DateTime        @map("starts_at") @db.Timestamptz(3)
+  priceCents  Int             @map("price_cents")
+  currency    String          @default("USD") @db.VarChar(10)
+  createdAt   DateTime        @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  movie       Movie           @relation(fields: [movieId], references: [id], onDelete: Cascade)
+  theatre     Theatre         @relation(fields: [theatreId], references: [id], onDelete: Cascade)
+  screen      Screen          @relation(fields: [screenId], references: [id], onDelete: Cascade)
+  inventories SeatInventory[]
+  bookings    Booking[]
+
+  @@index([movieId])
+  @@index([startsAt])
+  @@map("showtimes")
+}
+
+model SeatInventory {
+  id         String    @id @default(uuid())
+  showtimeId String    @map("showtime_id")
+  seatId     String    @map("seat_id")
+  status     String    @default("AVAILABLE") @db.VarChar(30)
+  priceCents Int       @map("price_cents")
+  version    Int       @default(1)
+  heldUntil        DateTime? @map("held_until") @db.Timestamptz(3)
+  holdingBookingId String?   @map("holding_booking_id")
+  createdAt        DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt  DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  showtime   Showtime  @relation(fields: [showtimeId], references: [id], onDelete: Cascade)
+  seat       Seat      @relation(fields: [seatId], references: [id], onDelete: Cascade)
+
+  @@unique([showtimeId, seatId])
+  @@map("seat_inventories")
+}
+
+model Booking {
+  id           String        @id @default(uuid())
+  ref          String        @unique @db.VarChar(50)
+  showtimeId   String        @map("showtime_id")
+  status       String        @default("HELD") @db.VarChar(30)
+  amountCents  Int           @map("amount_cents")
+  currency     String        @default("USD") @db.VarChar(10)
+  phone        String?       @db.VarChar(50)
+  qrPayload    String?       @map("qr_payload") @db.VarChar(255)
+  expiresAt    DateTime?     @map("expires_at") @db.Timestamptz(3)
+  createdAt    DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt    DateTime      @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  showtime     Showtime      @relation(fields: [showtimeId], references: [id], onDelete: Cascade)
+  bookingSeats BookingSeat[]
+
+  @@map("bookings")
+}
+
+model BookingSeat {
+  id         String   @id @default(uuid())
+  bookingId  String   @map("booking_id")
+  seatId     String   @map("seat_id")
+  priceCents Int      @map("price_cents")
+
+  booking    Booking  @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  seat       Seat     @relation(fields: [seatId], references: [id], onDelete: Cascade)
+
+  @@unique([bookingId, seatId])
+  @@map("booking_seats")
+}
 
 /// Idempotency ledger. Generic on purpose: it survives `make reset-domain`
 /// and is the reference implementation the real domain copies tomorrow.

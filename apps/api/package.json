@@ -18,7 +18,11 @@
     "prisma:generate": "prisma generate",
     "prisma:migrate:dev": "prisma migrate dev",
     "prisma:migrate:deploy": "prisma migrate deploy",
+    "db:seed": "prisma db seed",
     "clean": "rm -rf dist .turbo coverage *.tsbuildinfo"
+  },
+  "prisma": {
+    "seed": "tsx prisma/seed.ts"
   },
   "dependencies": {
     "@baseplate/contracts": "workspace:*",

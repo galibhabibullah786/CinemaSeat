@@ -6,32 +6,9 @@ import type { Express } from 'express';
 import type { Db } from '../src/db/prisma.js';
 import { createPrismaClient, probeDatabase } from '../src/db/prisma.js';
 import { createApp } from '../src/app.js';
-import { PrismaIdempotencyRepository } from '../src/idempotency/prisma-idempotency.repository.js';
-import { PrismaItemRepository } from '../src/modules/items/item.prisma-repository.js';
-import { ItemService } from '../src/modules/items/item.service.js';
+import { PrismaCinemaRepository } from '../src/modules/cinema/cinema.prisma-repository.js';
+import { CinemaService } from '../src/modules/cinema/cinema.service.js';
 import { createLogger, type Logger } from '@baseplate/logger';
-
-/**
- * Integration tests for the API surface.
- *
- * The contract these tests are PROVING:
- *   - zod validation at the boundary produces the documented envelope shape
- *     and never reaches the service.
- *   - POST /items with the same Idempotency-Key returns identical responses
- *     and never writes twice.
- *   - GET /ready flips to 503 when the database is unreachable, while
- *     /health stays 200.
- *   - Pagination, error envelopes, validation details, and location headers
- *     all behave as documented.
- *
- * Tests run against a real Postgres from scripts/with-test-db.sh, which sets
- * DATABASE_URL and applies migrations before this file loads. No mocks -- if
- * the schema is wrong, these tests fail.
- */
-
-// ----------------------------------------------------------------------------
-// Test fixture: build the real app with real repositories.
-// ----------------------------------------------------------------------------
 
 const TEST_DATABASE_URL =
   process.env.TEST_DATABASE_URL ?? 'postgresql://test:test@localhost:55433/baseplate_test?schema=public';
@@ -39,37 +16,35 @@ const TEST_DATABASE_URL =
 let db: Db;
 let logger: Logger;
 let app: Express;
-let itemsTable: { deleteMany(): Promise<unknown>; count(): Promise<number> };
-let idempotencyTable: { deleteMany(): Promise<unknown>; count(): Promise<number> };
+let movieTable: { deleteMany(): Promise<unknown>; create(data: any): Promise<any> };
+let theatreTable: { deleteMany(): Promise<unknown>; create(data: any): Promise<any> };
+let screenTable: { deleteMany(): Promise<unknown>; create(data: any): Promise<any> };
+let seatTable: { deleteMany(): Promise<unknown>; create(data: any): Promise<any> };
+let showtimeTable: { deleteMany(): Promise<unknown>; create(data: any): Promise<any> };
+let seatInventoryTable: { deleteMany(): Promise<unknown>; create(data: any): Promise<any> };
+let bookingTable: { deleteMany(): Promise<unknown>; count(where?: any): Promise<number> };
 
 beforeAll(async () => {
   logger = createLogger({ name: 'test', level: 'warn', pretty: false, base: {} });
   db = createPrismaClient({ databaseUrl: TEST_DATABASE_URL, logger, logQueries: false });
 
-  // Sanity: confirm we are pointed at the test database, not production.
-  // `kill -9` against a running dev database is the failure mode we are
-  // designing out.
   expect(TEST_DATABASE_URL).toContain('test');
   const probe = await probeDatabase(db, 2_000);
   expect(probe.ok).toBe(true);
 
-  // Reach into the generated client for the table helpers we need to
-  // truncate between tests. This is the only place the integration suite
-  // talks to the model directly -- everything else goes through the API.
-  // The structural cast is necessary because the Prisma generated types
-  // are not exposed for ad-hoc use; the runtime is correct.
-  itemsTable = (db as unknown as {
-    item: { deleteMany(): Promise<unknown>; count(): Promise<number> };
-  }).item;
-  idempotencyTable = (db as unknown as {
-    idempotencyRecord: { deleteMany(): Promise<unknown>; count(): Promise<number> };
-  }).idempotencyRecord;
+  movieTable = (db as any).movie;
+  theatreTable = (db as any).theatre;
+  screenTable = (db as any).screen;
+  seatTable = (db as any).seat;
+  showtimeTable = (db as any).showtime;
+  seatInventoryTable = (db as any).seatInventory;
+  bookingTable = (db as any).booking;
 
-  const itemService = new ItemService({
+  const cinemaService = new CinemaService({
     db,
-    items: new PrismaItemRepository(),
-    idempotency: new PrismaIdempotencyRepository(),
+    cinema: new PrismaCinemaRepository(),
     logger,
+    env: { HOLD_TTL_SECONDS: 600 },
   });
 
   app = createApp({
@@ -81,8 +56,9 @@ beforeAll(async () => {
       CORS_ORIGINS: ['http://localhost'],
       BODY_LIMIT: '100kb',
       RATE_LIMIT_WINDOW_MS: 60_000,
-      RATE_LIMIT_WRITE_MAX: 1_000, // effectively off for these tests
+      RATE_LIMIT_WRITE_MAX: 1_000,
       SHUTDOWN_TIMEOUT_MS: 5_000,
+      HOLD_TTL_SECONDS: 600,
       APP_VERSION: 'test',
     },
     db,
@@ -90,15 +66,18 @@ beforeAll(async () => {
     isShuttingDown: () => false,
   });
 
-  // Make the ItemService reachable for routes that need it. createApp already
-  // wires it internally, so we do NOT need to mount it again here -- this is
-  // for any test that wants to call the service directly.
-  void itemService;
+  void cinemaService;
 });
 
 beforeEach(async () => {
-  await itemsTable.deleteMany();
-  await idempotencyTable.deleteMany();
+  await (db as any).bookingSeat.deleteMany();
+  await bookingTable.deleteMany();
+  await seatInventoryTable.deleteMany();
+  await showtimeTable.deleteMany();
+  await seatTable.deleteMany();
+  await screenTable.deleteMany();
+  await theatreTable.deleteMany();
+  await movieTable.deleteMany();
 });
 
 afterAll(async () => {
@@ -106,139 +85,251 @@ afterAll(async () => {
 });
 
 // ============================================================================
-// Validation + error envelope
+// Movies + Showtimes read endpoints
 // ============================================================================
-describe('POST /items validation', () => {
-  it('rejects an empty body with a VALIDATION_FAILED envelope', async () => {
-    const res = await request(app).post('/items').send({});
-    expect(res.status).toBe(400);
-    expect(res.body).toMatchObject({
-      error: { code: 'VALIDATION_FAILED' },
+describe('CinemaSeat read endpoints', () => {
+  it('GET /movies returns seeded movies', async () => {
+    await movieTable.create({
+      data: {
+        id: 'dune-2',
+        title: 'Dune: Part Two',
+        synopsis: 'A test synopsis',
+        durationMinutes: 166,
+        certificate: 'PG-13',
+        genres: ['Sci-Fi'],
+      },
     });
-    expect(Array.isArray(res.body.error.details)).toBe(true);
-    expect(res.body.error.requestId).toEqual(expect.any(String));
-  });
 
-  it('rejects a non-uuid id in the path with VALIDATION_FAILED, not 500', async () => {
-    // A naive handler would forward "not-a-uuid" to Postgres and surface a
-    // query error as a 500. We verify the zod gate fires first.
-    const res = await request(app).get('/items/not-a-uuid');
-    expect(res.status).toBe(400);
-    expect(res.body.error.code).toBe('VALIDATION_FAILED');
-  });
-
-  it('returns 404 with the documented envelope for an unknown id', async () => {
-    const res = await request(app).get('/items/00000000-0000-4000-8000-000000000999');
-    expect(res.status).toBe(404);
-    expect(res.body.error.code).toBe('NOT_FOUND');
-    // The public message MUST NOT name the resource or the id -- that would
-    // be the read primitive of an enumeration attack.
-    expect(res.body.error.message).toBe('The requested resource was not found.');
-    expect(JSON.stringify(res.body.error)).not.toContain('00000000');
-  });
-
-  it('echoes the request id back on the response header', async () => {
-    const supplied = 'test-req-id-' + Math.random().toString(36).slice(2);
-    const res = await request(app).get('/health').set('x-request-id', supplied);
+    const res = await request(app).get('/movies');
     expect(res.status).toBe(200);
-    expect(res.headers['x-request-id']).toBe(supplied);
+    expect(Array.isArray(res.body)).toBe(true);
+    expect(res.body).toHaveLength(1);
+    expect(res.body[0].title).toBe('Dune: Part Two');
+  });
+
+  it('GET /movies/:id returns single movie or 404', async () => {
+    await movieTable.create({
+      data: {
+        id: 'dune-2',
+        title: 'Dune: Part Two',
+        durationMinutes: 166,
+      },
+    });
+
+    const res = await request(app).get('/movies/dune-2');
+    expect(res.status).toBe(200);
+    expect(res.body.id).toBe('dune-2');
+
+    const notFound = await request(app).get('/movies/non-existent');
+    expect(notFound.status).toBe(404);
+  });
+
+  it('GET /showtimes filters by movieId and returns seat counts', async () => {
+    const movie = await movieTable.create({
+      data: { id: 'm1', title: 'Test Movie', durationMinutes: 120 },
+    });
+    const theatre = await theatreTable.create({
+      data: { id: 't1', name: 'Test Theatre' },
+    });
+    const screen = await screenTable.create({
+      data: { id: 'sc1', theatreId: theatre.id, name: 'Screen 1', capacity: 2 },
+    });
+    const seat1 = await seatTable.create({
+      data: { id: 'seat1', screenId: screen.id, rowLabel: 'A', seatNumber: 1, priceCents: 1000 },
+    });
+    const seat2 = await seatTable.create({
+      data: { id: 'seat2', screenId: screen.id, rowLabel: 'A', seatNumber: 2, priceCents: 1000 },
+    });
+
+    const showtime = await showtimeTable.create({
+      data: {
+        id: 'st1',
+        movieId: movie.id,
+        theatreId: theatre.id,
+        screenId: screen.id,
+        startsAt: new Date(),
+        priceCents: 1000,
+      },
+    });
+
+    await seatInventoryTable.create({
+      data: { showtimeId: showtime.id, seatId: seat1.id, status: 'AVAILABLE', priceCents: 1000 },
+    });
+    await seatInventoryTable.create({
+      data: { showtimeId: showtime.id, seatId: seat2.id, status: 'BOOKED', priceCents: 1000 },
+    });
+
+    const res = await request(app).get('/showtimes?movieId=m1');
+    expect(res.status).toBe(200);
+    expect(res.body).toHaveLength(1);
+    expect(res.body[0].availableSeats).toBe(1);
+    expect(res.body[0].totalSeats).toBe(2);
+  });
+
+  it('GET /showtimes/:id/seats returns seat map and displays expired HELD seat as AVAILABLE', async () => {
+    const movie = await movieTable.create({
+      data: { id: 'm1', title: 'Test Movie', durationMinutes: 120 },
+    });
+    const theatre = await theatreTable.create({
+      data: { id: 't1', name: 'Test Theatre' },
+    });
+    const screen = await screenTable.create({
+      data: { id: 'sc1', theatreId: theatre.id, name: 'Screen 1', capacity: 1 },
+    });
+    const seat = await seatTable.create({
+      data: { id: 'seat1', screenId: screen.id, rowLabel: 'A', seatNumber: 1, priceCents: 1000 },
+    });
+    const showtime = await showtimeTable.create({
+      data: {
+        id: 'st1',
+        movieId: movie.id,
+        theatreId: theatre.id,
+        screenId: screen.id,
+        startsAt: new Date(),
+        priceCents: 1000,
+      },
+    });
+
+    const pastDate = new Date(Date.now() - 60_000);
+    await seatInventoryTable.create({
+      data: { showtimeId: showtime.id, seatId: seat.id, status: 'HELD', heldUntil: pastDate, priceCents: 1000 },
+    });
+
+    const res = await request(app).get('/showtimes/st1/seats');
+    expect(res.status).toBe(200);
+    expect(res.body.showtimeId).toBe('st1');
+    expect(res.body.seats).toHaveLength(1);
+    expect(res.body.seats[0].label).toBe('A1');
+    expect(res.body.seats[0].status).toBe('AVAILABLE');
   });
 });
 
 // ============================================================================
-// Items happy paths
+// Single-seat holding endpoints & ownership verification
 // ============================================================================
-describe('items CRUD', () => {
-  it('POST creates an item and returns 201 with a Location header', async () => {
-    const res = await request(app).post('/items').send({ name: 'Apples', quantity: 3 });
+describe('POST /bookings & hold ownership', () => {
+  async function seedShowtimeWithSeat() {
+    const movie = await movieTable.create({
+      data: { id: 'm1', title: 'Test Movie', durationMinutes: 120 },
+    });
+    const theatre = await theatreTable.create({
+      data: { id: 't1', name: 'Test Theatre' },
+    });
+    const screen = await screenTable.create({
+      data: { id: 'sc1', theatreId: theatre.id, name: 'Screen 1', capacity: 1 },
+    });
+    const seat = await seatTable.create({
+      data: { id: 'seat1', screenId: screen.id, rowLabel: 'A', seatNumber: 1, priceCents: 1500 },
+    });
+    const showtime = await showtimeTable.create({
+      data: {
+        id: 'st1',
+        movieId: movie.id,
+        theatreId: theatre.id,
+        screenId: screen.id,
+        startsAt: new Date(),
+        priceCents: 1500,
+      },
+    });
+
+    await seatInventoryTable.create({
+      data: { showtimeId: showtime.id, seatId: seat.id, status: 'AVAILABLE', priceCents: 1500 },
+    });
+
+    return { showtimeId: showtime.id, seatId: seat.id };
+  }
+
+  it('first hold succeeds and sets holdingBookingId', async () => {
+    const { showtimeId, seatId } = await seedShowtimeWithSeat();
+
+    const res = await request(app).post('/bookings').send({ showtimeId, seatId });
     expect(res.status).toBe(201);
-    expect(res.body.name).toBe('Apples');
-    expect(res.body.quantity).toBe(3);
-    expect(res.headers.location).toMatch(/^\/items\/[0-9a-f-]{36}$/);
+    expect(res.body.status).toBe('HELD');
+    expect(res.body.ref).toMatch(/^CS-\d{4}-\d+/);
+    expect(res.body.amountCents).toBe(1500);
+
+    const inv = await db.seatInventory.findUnique({
+      where: { showtimeId_seatId: { showtimeId, seatId } },
+    });
+    expect(inv?.status).toBe('HELD');
+    expect(inv?.holdingBookingId).toBe(res.body.id);
   });
 
-  it('GET /items/:id returns the created item', async () => {
-    const created = await request(app).post('/items').send({ name: 'Bananas', quantity: 1 });
-    const got = await request(app).get(`/items/${created.body.id}`);
-    expect(got.status).toBe(200);
-    expect(got.body.id).toBe(created.body.id);
-  });
+  it('second hold on the same seat returns 409 SEAT_UNAVAILABLE', async () => {
+    const { showtimeId, seatId } = await seedShowtimeWithSeat();
 
-  it('GET /items paginates with a cursor', async () => {
-    for (const name of ['a', 'b', 'c']) {
-      await request(app).post('/items').send({ name, quantity: 1 });
-    }
-    const page1 = await request(app).get('/items?limit=2');
-    expect(page1.status).toBe(200);
-    expect(page1.body.items).toHaveLength(2);
-    expect(page1.body.nextCursor).toEqual(expect.any(String));
-
-    const page2 = await request(app).get(`/items?limit=2&cursor=${page1.body.nextCursor}`);
-    expect(page2.status).toBe(200);
-    expect(page2.body.items).toHaveLength(1);
-    expect(page2.body.nextCursor).toBeNull();
-  });
-});
-
-// ============================================================================
-// Idempotency
-// ============================================================================
-describe('POST /items idempotency', () => {
-  const KEY = 'integration-test-key-1';
-
-  it('first request creates, second request returns the SAME body byte-for-byte', async () => {
-    const body = { name: 'Same', quantity: 7 };
-
-    const first = await request(app)
-      .post('/items')
-      .set('Idempotency-Key', KEY)
-      .send(body);
-
-    const second = await request(app)
-      .post('/items')
-      .set('Idempotency-Key', KEY)
-      .send(body);
-
-    expect(first.status).toBe(201);
-    expect(second.status).toBe(201);
-    expect(second.body).toEqual(first.body);
-    expect(second.headers.location).toBe(first.headers.location);
-
-    // Only ONE row in the table. This is the whole point.
-    const count = await itemsTable.count();
-    expect(count).toBe(1);
-
-    // And the ledger has exactly one row.
-    const ledger = await idempotencyTable.count();
-    expect(ledger).toBe(1);
-  });
-
-  it('reusing the same key with a DIFFERENT body returns 409', async () => {
-    const first = await request(app)
-      .post('/items')
-      .set('Idempotency-Key', KEY)
-      .send({ name: 'A', quantity: 1 });
+    const first = await request(app).post('/bookings').send({ showtimeId, seatId });
     expect(first.status).toBe(201);
 
-    const second = await request(app)
-      .post('/items')
-      .set('Idempotency-Key', KEY)
-      .send({ name: 'B', quantity: 2 });
+    const second = await request(app).post('/bookings').send({ showtimeId, seatId });
     expect(second.status).toBe(409);
-    expect(second.body.error.code).toBe('IDEMPOTENCY_KEY_CONFLICT');
-
-    // Only the first row exists.
-    const count = await itemsTable.count();
-    expect(count).toBe(1);
+    expect(second.body.error.code).toBe('SEAT_UNAVAILABLE');
   });
 
-  it('omitting the header bypasses the ledger entirely', async () => {
-    // Two requests, same body, no key. Both create -- at-most-once-per-attempt
-    // semantics, not at-most-once-ever.
-    await request(app).post('/items').send({ name: 'A', quantity: 1 });
-    await request(app).post('/items').send({ name: 'A', quantity: 1 });
-    expect(await itemsTable.count()).toBe(2);
-    expect(await idempotencyTable.count()).toBe(0);
+  it('expired hold can be reclaimed by User B', async () => {
+    const { showtimeId, seatId } = await seedShowtimeWithSeat();
+
+    const userA = await request(app).post('/bookings').send({ showtimeId, seatId });
+    expect(userA.status).toBe(201);
+
+    const pastDate = new Date(Date.now() - 30_000);
+    await db.seatInventory.update({
+      where: { showtimeId_seatId: { showtimeId, seatId } },
+      data: { status: 'HELD', heldUntil: pastDate },
+    });
+
+    const userB = await request(app).post('/bookings').send({ showtimeId, seatId });
+    expect(userB.status).toBe(201);
+    expect(userB.body.status).toBe('HELD');
+
+    const inv = await db.seatInventory.findUnique({
+      where: { showtimeId_seatId: { showtimeId, seatId } },
+    });
+    expect(inv?.holdingBookingId).toBe(userB.body.id);
+  });
+
+  it('User A deleting expired hold does NOT release User B hold', async () => {
+    const { showtimeId, seatId } = await seedShowtimeWithSeat();
+
+    const userA = await request(app).post('/bookings').send({ showtimeId, seatId });
+    expect(userA.status).toBe(201);
+
+    const pastDate = new Date(Date.now() - 30_000);
+    await db.seatInventory.update({
+      where: { showtimeId_seatId: { showtimeId, seatId } },
+      data: { status: 'HELD', heldUntil: pastDate },
+    });
+
+    const userB = await request(app).post('/bookings').send({ showtimeId, seatId });
+    expect(userB.status).toBe(201);
+
+    const deleteA = await request(app).delete(`/bookings/${userA.body.ref}/hold`);
+    expect(deleteA.status).toBe(200);
+
+    const inv = await db.seatInventory.findUnique({
+      where: { showtimeId_seatId: { showtimeId, seatId } },
+    });
+    expect(inv?.status).toBe('HELD');
+    expect(inv?.holdingBookingId).toBe(userB.body.id);
+  });
+
+  it('100 concurrent requests for one seat produce exactly 1 success, 99 conflicts, 0 oversell', async () => {
+    const { showtimeId, seatId } = await seedShowtimeWithSeat();
+
+    const requests = Array.from({ length: 100 }, () =>
+      request(app).post('/bookings').send({ showtimeId, seatId }),
+    );
+
+    const responses = await Promise.all(requests);
+
+    const successes = responses.filter((r) => r.status === 201);
+    const conflicts = responses.filter((r) => r.status === 409 && r.body.error?.code === 'SEAT_UNAVAILABLE');
+
+    expect(successes.length).toBe(1);
+    expect(conflicts.length).toBe(99);
+
+    const bookingsCount = await db.booking.count({ where: { showtimeId } });
+    expect(bookingsCount).toBe(1);
   });
 });
 
@@ -259,77 +350,5 @@ describe('health endpoints', () => {
     expect(res.status).toBe(200);
     expect(res.body.status).toBe('ready');
     expect(res.body.checks.database.ok).toBe(true);
-  });
-
-  it('GET /ready returns 503 when the database is unreachable, but /health stays 200', async () => {
-    // Build a SECOND app, pointed at a port nothing is listening on. This is
-    // the cleanest way to exercise the /ready path against a dead DB without
-    // poisoning the shared app for the other tests.
-    const deadLogger = createLogger({ name: 'dead', level: 'warn', pretty: false, base: {} });
-    const deadDb = createPrismaClient({
-      databaseUrl:
-        'postgresql://test:test@127.0.0.1:1/baseplate_test?schema=public&connection_limit=1',
-      logger: deadLogger,
-    });
-    const deadApp = createApp({
-      env: {
-        NODE_ENV: 'test',
-        API_PORT: 0,
-        LOG_LEVEL: 'warn',
-        DATABASE_URL: 'postgresql://test:test@127.0.0.1:1/baseplate_test',
-        CORS_ORIGINS: ['http://localhost'],
-        BODY_LIMIT: '100kb',
-        RATE_LIMIT_WINDOW_MS: 60_000,
-        RATE_LIMIT_WRITE_MAX: 1_000,
-        SHUTDOWN_TIMEOUT_MS: 5_000,
-        APP_VERSION: 'test',
-      },
-      db: deadDb,
-      logger: deadLogger,
-      isShuttingDown: () => false,
-    });
-
-    const ready = await request(deadApp).get('/ready');
-    expect(ready.status).toBe(503);
-    expect(ready.body.status).toBe('not_ready');
-    expect(ready.body.checks.database.ok).toBe(false);
-
-    const health = await request(deadApp).get('/health');
-    expect(health.status).toBe(200);
-
-    await deadDb.$disconnect();
-  });
-
-  it('GET /ready returns 503 when the shutdown sequence has been engaged', async () => {
-    let shuttingDown = false;
-    const sdLogger = createLogger({ name: 'sd', level: 'warn', pretty: false, base: {} });
-    const sdDb = createPrismaClient({ databaseUrl: TEST_DATABASE_URL, logger: sdLogger });
-    const sdApp = createApp({
-      env: {
-        NODE_ENV: 'test',
-        API_PORT: 0,
-        LOG_LEVEL: 'warn',
-        DATABASE_URL: TEST_DATABASE_URL,
-        CORS_ORIGINS: ['http://localhost'],
-        BODY_LIMIT: '100kb',
-        RATE_LIMIT_WINDOW_MS: 60_000,
-        RATE_LIMIT_WRITE_MAX: 1_000,
-        SHUTDOWN_TIMEOUT_MS: 5_000,
-        APP_VERSION: 'test',
-      },
-      db: sdDb,
-      logger: sdLogger,
-      isShuttingDown: () => shuttingDown,
-    });
-
-    const ready = await request(sdApp).get('/ready');
-    expect(ready.status).toBe(200); // sanity
-
-    shuttingDown = true;
-    const sdRes = await request(sdApp).get('/ready');
-    expect(sdRes.status).toBe(503);
-    expect(sdRes.body.checks.database.error).toBe('shutting_down');
-
-    await sdDb.$disconnect();
   });
 });

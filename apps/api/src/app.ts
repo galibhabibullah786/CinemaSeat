@@ -11,14 +11,10 @@ import { errorHandler, notFoundHandler } from './http/middleware/error-handler.j
 import { rateLimitWrites } from './http/middleware/rate-limit.js';
 import { requestLog } from './http/middleware/request-log.js';
 import { healthRoutes } from './http/routes/health.routes.js';
-import { PrismaIdempotencyRepository } from './idempotency/prisma-idempotency.repository.js';
-
-// >>> DEMO-DOMAIN:items -- removed by scripts/reset-domain.sh
-import { ItemHandler } from './modules/items/item.handler.js';
-import { PrismaItemRepository } from './modules/items/item.prisma-repository.js';
-import { itemRoutes } from './modules/items/item.routes.js';
-import { ItemService } from './modules/items/item.service.js';
-// <<< DEMO-DOMAIN:items
+import { CinemaHandler } from './modules/cinema/cinema.handler.js';
+import { PrismaCinemaRepository } from './modules/cinema/cinema.prisma-repository.js';
+import { bookingRoutes, movieRoutes, showtimeRoutes } from './modules/cinema/cinema.routes.js';
+import { CinemaService } from './modules/cinema/cinema.service.js';
 
 export interface CreateAppDeps {
   env: Env;
@@ -126,15 +122,18 @@ export function createApp(deps: CreateAppDeps): Express {
     }),
   );
 
-  // >>> DEMO-DOMAIN:items -- removed by scripts/reset-domain.sh
-  const itemService = new ItemService({
+  const cinemaService = new CinemaService({
     db,
-    items: new PrismaItemRepository(),
-    idempotency: new PrismaIdempotencyRepository(),
+    cinema: new PrismaCinemaRepository(),
     logger,
+    env: {
+      HOLD_TTL_SECONDS: env.HOLD_TTL_SECONDS,
+    },
   });
-  app.use('/items', itemRoutes(new ItemHandler(itemService)));
-  // <<< DEMO-DOMAIN:items
+  const cinemaHandler = new CinemaHandler(cinemaService);
+  app.use('/movies', movieRoutes(cinemaHandler));
+  app.use('/showtimes', showtimeRoutes(cinemaHandler));
+  app.use('/bookings', bookingRoutes(cinemaHandler));
 
   // --- terminal middleware --------------------------------------------------
   // Both must be last, and in this order.
