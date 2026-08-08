@@ -5,13 +5,18 @@ to the ADRs are in `[ADR-0001]` style.
 
 ## Deploy
 
+The target is a single AWS EC2 instance. First-time setup of that
+instance and its IAM roles is
+[deploy-aws-ec2.md](deploy-aws-ec2.md) — this section assumes it is
+already done.
+
 The CD pipeline is the intended path. It runs ONLY after a green CI on
 the same SHA — the `workflow_run` trigger on `cd.yml` fires when the
 `ci.yml` run completes successfully ([ADR-0008](adr/0008-ci-gates-cd.md)).
 A red CI silently skips CD; there is no deploy from a failing check.
 
 The `cd.yml` workflow can also be re-run by hand via `workflow_dispatch`
-for break-glass scenarios.
+for break-glass scenarios and rollbacks.
 
 ```bash
 # 1. Push to main.
@@ -23,38 +28,69 @@ git push origin main
 # 4. Confirm:     curl https://<your-host>/api/ready
 ```
 
+CI publishes the images; CD deploys them and builds nothing
+([ADR-0009](adr/0009-images-built-once-in-ci.md)).
+
+The CI workflow, after its quality gates:
+1. Builds, scans and pushes `baseplate-api`, `baseplate-migrate` and
+   `baseplate-web` to GHCR, tagged `sha-<short-sha>` (immutable, what we
+   deploy). Path-gated: only images whose inputs changed are rebuilt.
+2. `image-promote` backfills the SHA tag for images that were not
+   rebuilt, then moves `latest` (a convenience for local
+   `docker compose pull`; never deployed).
+
 The CD workflow:
-1. Builds + pushes API and web images to GHCR, tagged with BOTH
-   `sha-<short-sha>` (immutable, what we deploy) and `latest` (convenience).
-2. SSHes to the deploy host.
-3. `docker compose pull` to fetch the new images.
-4. `prisma migrate deploy` first (the running app is backward-compatible
-   with the OLD schema by design — see ADR-0002).
-5. `docker compose up -d` to roll the new images.
-6. Polls `/api/ready` until 200 or 30 attempts.
+1. `gate` — resolves the SHA and image tag; refuses anything that is not
+   a green CI on a push to `main`.
+2. `verify-images` — asserts all three tags resolve in GHCR. A missing
+   image fails here, before the host is touched.
+3. `deploy-ec2` — assumes an AWS role via OIDC (no stored credential),
+   sends `scripts/deploy.sh --pull` to the instance with SSM Run
+   Command, and streams the remote output into the job log
+   ([ADR-0010](adr/0010-oidc-ssm-deploy-to-ec2.md)).
+4. On the host, `deploy.sh` does: `docker compose pull` → `up -d` →
+   wait for healthy → `prisma migrate deploy` → poll `/api/ready` until
+   200 or 30 attempts. Migrations run as a deliberate separate step,
+   never at container start.
+5. Back on the runner, `${PUBLIC_URL}/api/ready` is polled from
+   *outside* — the only check that also proves the security group and
+   DNS work.
 
 ## Rollback
 
-The deploy references the SHA tag. Rolling back is redeploying the
-previous SHA:
+Rollback is a deploy of the previous tag. Nothing else changes.
 
-```bash
-# On the deploy host:
-docker compose -p baseplate-prod -f docker/compose.prod.yaml --env-file .env \
-  pull
-IMAGE_TAG=sha-abc1234 docker compose -p baseplate-prod -f docker/compose.prod.yaml \
-  --env-file .env up -d
+**Actions → cd → Run workflow**, and set the `tag` input to the
+previous `sha-<short>`:
+
+```
+tag: sha-9f2c1ab
 ```
 
-To find the previous SHA:
+`workflow_dispatch` bypasses the CI gate by design: during an incident
+the thing you want to deploy is a commit whose CI passed hours ago.
+
+To find the previous tag:
 
 ```bash
-# GitHub: actions -> cd -> "build-and-push" job -> "Compute short SHA" step
-# Locally:  git log --oneline -10
+# GitHub: actions -> cd -> the last good run -> job summary table.
+# Or, from the host:
+aws ssm start-session --target <instance-id>
+sudo docker ps --format '{{.Image}}'
 ```
 
-A full rollback to a specific commit is the same shape with that commit's
-SHA. The `latest` tag is NOT used for rollback — it has moved.
+If GitHub Actions itself is unavailable, do it on the host directly:
+
+```bash
+aws ssm start-session --target <instance-id>
+cd /opt/baseplate
+sudo IMAGE_TAG=sha-9f2c1ab bash scripts/deploy.sh --pull
+```
+
+`scripts/deploy.sh` gives a caller-supplied `IMAGE_TAG` precedence over
+the one in `.env`, so this deploys exactly the tag named.
+
+The `latest` tag is NOT used for rollback — it has moved.
 
 ## Break-glass merge
 
@@ -62,21 +98,32 @@ If GitHub Actions is unavailable and the demo is in 30 minutes:
 
 1. Build the images locally:
    ```bash
-   IMAGE_TAG=manual-$(date +%Y%m%d-%H%M%S) make prod
+   export IMAGE_TAG=manual-$(date +%Y%m%d-%H%M%S)
+   make prod          # builds api + web
+   docker compose -p baseplate-prod -f docker/compose.prod.yaml \
+     --env-file .env --profile migrate build migrate
    ```
-2. Push to GHCR from the deploy host:
+2. Push all THREE to GHCR. `compose.prod.yaml` resolves `api`, `web`
+   and `migrate` from the same `${IMAGE_TAG}`; a missing `migrate`
+   image means the migration step builds from source on the production
+   host mid-deploy:
    ```bash
    docker login ghcr.io
-   docker push ghcr.io/<owner>/baseplate-api:manual-...
-   docker push ghcr.io/<owner>/baseplate-web:manual-...
+   for i in api web migrate; do
+     docker push "ghcr.io/<owner>/baseplate-$i:${IMAGE_TAG}"
+   done
    ```
-3. Deploy by hand:
+3. Deploy by hand, on the host:
    ```bash
-   IMAGE_TAG=manual-... docker compose -p baseplate-prod \
-     -f docker/compose.prod.yaml --env-file .env up -d
+   aws ssm start-session --target <instance-id>
+   cd /opt/baseplate
+   sudo IMAGE_TAG=manual-... bash scripts/deploy.sh --pull
    ```
 4. Comment in the PR with a one-line explanation so the audit trail is
    intact.
+
+These images were never scanned. Open an issue to rebuild through the
+pipeline as soon as it is back.
 
 ## Common failures
 
@@ -89,13 +136,39 @@ commit's CI run.
 
 - If CI is red, fix the failing job and push. CD does not retry the
   red run; a new push produces a new CI -> CD pair.
-- If CI is green but CD was skipped, the gate's condition failed (a
-  GitHub-side hiccup, not a code problem). Re-run `cd.yml` from the
-  Actions UI with `workflow_dispatch` — the gate explicitly allows it,
-  and the deploy uses the current `main` HEAD. The `tag` input can
-  pin to a specific short SHA.
+- If CI is green but CD was skipped, check the `gate` job's condition.
+  It requires the CI run to have come from a **push** to **main** — a
+  green CI on a pull request deliberately does not deploy. Otherwise
+  re-run `cd.yml` from the Actions UI with `workflow_dispatch`; the
+  gate explicitly allows it, and the deploy uses the current `main`
+  HEAD. The `tag` input can pin to a specific short SHA.
 - If no CI run exists at all, the push did not land on `main`. CI does
   not run on feature branches.
+
+### 0b. CD failed at `verify-images`
+
+CD does not build images ([ADR-0009](adr/0009-images-built-once-in-ci.md));
+the tag it wants was never published. Open the `ci` run for that SHA:
+
+- `image-api` or `image-web` red → a Trivy HIGH/CRITICAL finding.
+  See failure 3 below. Nothing was promoted, and `latest` still points
+  at the last image that passed.
+- `image-promote` skipped → CI was not a push to `main`, or an earlier
+  gate failed.
+- `image-promote` red with "has neither :`<tag>` nor :latest" → the
+  registry has no prior manifest to copy for an image this commit did
+  not change. Push an empty commit touching `docker/` to force a full
+  rebuild.
+
+### 0c. CD failed at `deploy-ec2` with an AWS error
+
+`Not authorized to perform sts:AssumeRoleWithWebIdentity`,
+`InvalidInstanceId`, and the rest of the setup-shaped failures are
+catalogued in
+[deploy-aws-ec2.md → Troubleshooting](deploy-aws-ec2.md#11-troubleshooting).
+They are configuration problems, not release problems: the running
+version is untouched, because `deploy.sh` pulls before it stops
+anything.
 
 ### 1. /ready returns 503 but /health is 200
 

@@ -6,12 +6,19 @@ The pipeline is split across two workflows:
   every pull request targeting `main`. Lint, typecheck, unit tests,
   integration tests (real Postgres), security scans (pnpm audit,
   gitleaks, Trivy filesystem), end-to-end tests (Playwright against
-  `compose.prod`), and a Docker image build + scan.
+  `compose.prod`), and the **image lifecycle**: build, scan and push.
 - **`.github/workflows/cd.yml`** — runs ONLY when `ci.yml` finishes
-  successfully on the same SHA, or on `workflow_dispatch`. Builds +
-  pushes images to GHCR, then deploys over SSH to the production VM.
+  successfully for a push to `main`, or on `workflow_dispatch`.
+  Verifies the images CI published, then deploys them to AWS EC2 over
+  SSM. **CD builds nothing.**
 
-The gating decision is documented in [ADR-0008](adr/0008-ci-gates-cd.md).
+Three decisions shape this:
+
+| | |
+| --- | --- |
+| [ADR-0008](adr/0008-ci-gates-cd.md) | CI gates CD via `workflow_run`. |
+| [ADR-0009](adr/0009-images-built-once-in-ci.md) | Images are built, scanned and pushed exactly once, in CI. |
+| [ADR-0010](adr/0010-oidc-ssm-deploy-to-ec2.md) | The deploy transport is OIDC + SSM, not SSH. |
 
 ## The CI -> CD contract
 
@@ -19,35 +26,45 @@ The gating decision is documented in [ADR-0008](adr/0008-ci-gates-cd.md).
 push to main / pull_request
         |
         v
+   +---------+   lint, typecheck, unit, integration, security, e2e
+   |   ci    |   then: build + scan + push images, promote tags
    +---------+
-   |   ci    |   (lint, typecheck, unit, integration, security, e2e,
-   +---------+    docker build + scan)
         |
-        | workflow_run, conclusion = success
+        | workflow_run, conclusion = success, event = push, branch = main
         v
-   +---------+
-   |   cd    |   (build+push images -> SSH deploy -> poll /ready)
+   +---------+   verify the published tag -> OIDC -> SSM -> deploy.sh
+   |   cd    |   -> migrate -> poll /ready
    +---------+
 ```
 
 CD is triggered by `workflow_run` on the `ci` workflow, not by `push`.
-A `gate` job at the top of `cd.yml` enforces
-`conclusion == 'success'`; any other outcome (`failure`, `cancelled`,
-`timed_out`, `skipped`) short-circuits the deploy. There is no path
-from a red CI to a production deploy.
+The `gate` job at the top of `cd.yml` requires **three** things, not
+one:
+
+| Condition | Without it |
+| --- | --- |
+| `conclusion == 'success'` | `workflow_run` fires for `failure`, `cancelled` and `timed_out` too, and a red CI would deploy. |
+| `event == 'push'` | CI also runs on `pull_request`. A green CI on an in-repo PR branch would deploy that branch to production. |
+| `head_branch == 'main'` | A push to any other branch is not a release [ADR-0003]. |
 
 `workflow_dispatch` bypasses the gate by design — it is the
-break-glass path described in the runbook.
+break-glass and rollback path described in the runbook. Its optional
+`tag` input is validated against an anchored allowlist in the `gate`
+job before it reaches a shell on the production host.
 
 ## CI workflow shape
 
 The CI workflow is shaped around a **path filter** job
 (`.github/workflows/ci.yml: paths`) that produces a set of outputs
-(`api`, `web`, `config`, `docker`, `everything`, ...). Downstream jobs
-read these outputs and skip themselves when their scope is not
-affected:
+(`api`, `web`, `config`, `api_image`, `web_image`, `everything`, ...).
+Downstream jobs read these outputs and skip themselves when their scope
+is not affected:
 
 - `integration` runs only when `api` changed.
+- `image-api` runs only when `api_image` changed, `image-web` only
+  when `web_image` changed. Those two filters list exactly the paths
+  that can change each image's *content* — anything outside them
+  produces byte-identical bits, so rebuilding is pure cost.
 - `lint`, `typecheck`, `unit`, `security`, `e2e` run when
   `everything` changed (today: all jobs, but the filter is wired for
   future per-scope jobs).
@@ -57,24 +74,54 @@ A `setup` job installs dependencies once. Downstream jobs re-run
 restored resolves against the lockfile and exits quickly when nothing
 has changed.
 
-`docker-build` is the longest-running job (multi-stage buildx,
-Trivy scan, GHA cache). It depends on every other quality gate. CD
-pushes the same images with the same SHA tag — the build is
-load-only here (`load: true`), push happens in `cd.yml`'s
-`build-and-push`. The `latest` tag on GHCR is a convenience for
-local `docker compose pull`; it is NEVER used for deploys
-[ADR-0003].
+## Images
+
+Four jobs, all downstream of every quality gate:
+
+| Job | Does |
+| --- | --- |
+| `image-meta` | Resolves the tag (`sha-<short>`) and the publish decision (`push` on main only) **once**, so no downstream job can disagree about either. |
+| `image-api` | Builds `runtime` + `migrate` from `Dockerfile.api` (one job: they share every layer through `build`), scans both with Trivy, pushes both. |
+| `image-web` | Builds, scans and pushes the web image. |
+| `image-promote` | Backfills the SHA tag for images this commit did not change, then moves `:latest`. |
+
+Each image is produced by **one** `buildx` invocation whose exporter is
+the only thing that varies:
+
+| | pull request | push to main |
+| --- | --- | --- |
+| exporter | `load` (docker) | `push` (registry) |
+| attestations | off — the classic image store cannot import an index | provenance + SBOM |
+| Trivy scans | the local image | the pushed image (`TRIVY_USERNAME`/`PASSWORD`) |
+
+Either way, **the bytes that were scanned are the bytes that ship**.
+A HIGH/CRITICAL finding fails the image job, `image-promote` never
+runs, `:latest` never moves, and CD has nothing new to deploy.
+
+`image-promote` exists because the image jobs are path-gated while
+`compose.prod.yaml` resolves `api`, `web` **and** `migrate` from a
+single `${IMAGE_TAG}`. For any image not rebuilt, it copies the
+manifest `:latest` already points at onto the new SHA tag with
+`docker buildx imagetools create` — a registry-side manifest copy, so
+the digest is unchanged. The `latest` tag on GHCR is a convenience for
+local `docker compose pull`; it is NEVER used for deploys [ADR-0003].
 
 ## Permissions
 
 The workflow-level default is `contents: read`. Each job that needs
 more declares it:
 
-- `ci > docker-build`: `packages: write` for GHCR.
+- `ci > image-api`, `image-web`, `image-promote`: `packages: write`
+  for GHCR.
 - `cd > gate`: `contents: read` (the gate never touches GHCR).
-- `cd > build-and-push`: `packages: write` for GHCR.
-- `cd > deploy-ssh`: default `contents: read`; the SSH key is passed
-  via `secrets.DEPLOY_SSH_KEY`, not via permissions.
+- `cd > verify-images`: `packages: read`.
+- `cd > deploy-ec2`: `id-token: write` — and nothing else. That
+  permission mints the OIDC token `configure-aws-credentials`
+  exchanges for 30-minute STS credentials. It is declared on this job
+  alone; a workflow-level grant would hand an OIDC token to every job.
+
+There is no `AWS_ACCESS_KEY_ID` and no `DEPLOY_SSH_KEY` in this
+repository. See [deploy-aws-ec2.md](deploy-aws-ec2.md) for the AWS side.
 
 Fork PRs never have write tokens; the relevant `if:` guards refuse to
 run the GHCR-touching jobs. We deliberately do NOT use
@@ -103,12 +150,15 @@ Dependabot opens PRs that bump the SHAs as new versions ship.
 | `docker/setup-buildx-action` | v3.6.1 | `988b5a0280414f521da01fcc63a27aeeb4b104db` |
 | `docker/login-action` | v3.3.0 | `9780b0c442fbb1117ed29e0efdff1e18412f7567` |
 | `docker/build-push-action` | v6.1.0 | `31159d49c0d4756269a0940a750801a1ea5d7003` |
+| `github/codeql-action/upload-sarif` | v3.27.5 | `f09c1c0a94de965c15400f5634aa42fac8fb8f88` |
+| `aws-actions/configure-aws-credentials` | v4.2.1 | `b47578312673ae6fa5b5096b330d9fbac3d116df` |
 | `mxschmitt/action-tmate` | v3.15 | `73f5c99ee9e93dd1055edce60b76402a2139164b` |
 | `appleboy/ssh-action` | v1.0.3 | `029f5b4aeeeb58fdfe1410a5d17f967dacf36262` |
 
-`github/codeql-action/upload-sarif` is pinned to the `@v3` tag in
-`ci.yml` with a TODO note. Replace with the upstream commit SHA before
-the workflow touches production secrets.
+`appleboy/ssh-action` is retained only for the commented break-glass
+`deploy-ssh` job in `cd.yml` [ADR-0010]. `docker/setup-qemu-action` is
+no longer used: the images are single-platform (`linux/amd64`) and QEMU
+buys nothing until a second architecture is targeted.
 
 ## Local verification
 

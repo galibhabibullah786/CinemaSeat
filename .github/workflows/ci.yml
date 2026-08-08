@@ -16,10 +16,15 @@
 #  SHA pinning: every third-party action is pinned to a full commit SHA, with
 #  the tag kept as a comment. See docs/adr/0004.
 #
-#  Image build vs push: the `docker-build` job builds (and scans) the images
-#  but does not push. CD pushes the same images with the same SHA tag.
-#  See docs/adr/0008 for the CI -> CD gating that decides when a build
-#  becomes a deploy.
+#  Images are built EXACTLY ONCE, here. Each image job builds, scans and --
+#  on a push to main -- pushes in a single buildx invocation. CD does not
+#  build anything; it deploys the tag CI already published. See
+#  docs/adr/0009 for why, and docs/adr/0008 for the CI -> CD gating.
+#
+#  Image jobs are path-gated: a change that only touches apps/web does not
+#  rebuild the API image. `image-promote` restores the invariant CD relies
+#  on -- every deployable SHA has a full set of sha-<short> tags -- by
+#  copying the previous manifest for images that were not rebuilt.
 # ============================================================================
 
 name: ci
@@ -61,7 +66,8 @@ jobs:
       web: ${{ steps.filter.outputs.web }}
       contracts: ${{ steps.filter.outputs.contracts }}
       config: ${{ steps.filter.outputs.config }}
-      docker: ${{ steps.filter.outputs.docker }}
+      api_image: ${{ steps.filter.outputs.api_image }}
+      web_image: ${{ steps.filter.outputs.web_image }}
       workflows: ${{ steps.filter.outputs.workflows }}
       everything: ${{ steps.filter.outputs.everything }}
     steps:
@@ -88,13 +94,36 @@ jobs:
               - 'packages/config/**'
               - '.github/**'
               - 'turbo.json'
-            docker:
-              - 'docker/**'
+            # Image filters: the exact set of paths that can change the
+            # CONTENT of each image. Anything outside them produces a
+            # byte-identical image, so rebuilding is pure cost. Both lists
+            # include the workflow itself -- a change to how an image is
+            # built must produce a new image even when no source moved.
+            api_image:
               - 'apps/api/**'
-              - 'apps/web/**'
+              - 'packages/config/**'
+              - 'packages/contracts/**'
+              - 'packages/logger/**'
+              - 'docker/Dockerfile.api'
               - 'package.json'
               - 'pnpm-lock.yaml'
               - 'pnpm-workspace.yaml'
+              - '.npmrc'
+              - '.dockerignore'
+              - '.github/workflows/ci.yml'
+            web_image:
+              - 'apps/web/**'
+              - 'packages/config/**'
+              - 'packages/contracts/**'
+              - 'docker/Dockerfile.web'
+              - 'docker/nginx.conf'
+              - 'docker/nginx-security-headers.conf'
+              - 'package.json'
+              - 'pnpm-lock.yaml'
+              - 'pnpm-workspace.yaml'
+              - '.npmrc'
+              - '.dockerignore'
+              - '.github/workflows/ci.yml'
             workflows:
               - '.github/workflows/**'
             everything:
@@ -295,12 +324,9 @@ jobs:
         # Gitleaks/Trivy deliberately do NOT see fork PR secrets; the scans
         # run with the same default-deny token as everything else.
 
-      # NOTE: pinned to a tag, not a SHA. Replace with the commit SHA from
-      # https://github.com/github/codeql-action/commits/v3.27.5 before going
-      # to production. We were not able to fetch the registry in this sandbox.
       - name: Upload Trivy SARIF
         if: always()
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@f09c1c0a94de965c15400f5634aa42fac8fb8f88 # v3.27.5
         with:
           sarif_file: trivy-results.sarif
         continue-on-error: true
@@ -365,11 +391,26 @@ jobs:
         run: make down || true
 
   # --------------------------------------------------------------------------
-  # 6. Docker image build + scan. Skipped on fork PRs (no GHCR creds).
+  # 6. Images. Built, scanned and published HERE and nowhere else.
+  #
+  #    `image-meta` decides two things once, so the three image jobs below do
+  #    not each re-derive them (and cannot disagree):
+  #
+  #      tag  -- sha-<short>, the immutable coordinate CD deploys. Short, not
+  #              full: it is the tag the runbook, deploy.sh and rollback all
+  #              quote, and two spellings of "the same tag" is how a rollback
+  #              ends up pulling something that does not exist.
+  #      push -- true ONLY for a push to main. A PR build is proof the image
+  #              still builds and still scans clean; it is not a release, and
+  #              a PR that publishes to GHCR lets anyone with merge-less write
+  #              access seed the registry.
+  #
+  #    Skipped on fork PRs: no GHCR credentials, and no reason to trust the
+  #    Dockerfile in a fork's branch with them.
   # --------------------------------------------------------------------------
-  docker-build:
-    name: docker build + scan
-    needs: [lint, typecheck, unit, integration, security, e2e]
+  image-meta:
+    name: image metadata
+    needs: [paths, lint, typecheck, unit, integration, security, e2e]
     # `integration` is path-gated, and GitHub skips a job whose dependency was
     # skipped -- so a plain `needs` list silently skips the image build on any
     # change that does not touch the API. `!cancelled()` opts back in, and the
@@ -380,13 +421,53 @@ jobs:
       && !contains(needs.*.result, 'failure')
       && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
+    permissions: { contents: read }
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      push: ${{ steps.meta.outputs.push }}
+      api: ${{ needs.paths.outputs.api_image }}
+      web: ${{ needs.paths.outputs.web_image }}
+    steps:
+      - name: Resolve tag and publish decision
+        id: meta
+        run: |
+          set -euo pipefail
+          echo "tag=sha-$(echo "$GITHUB_SHA" | cut -c1-7)" >> "$GITHUB_OUTPUT"
+          if [ "$GITHUB_EVENT_NAME" = "push" ] && [ "$GITHUB_REF" = "refs/heads/main" ]; then
+            echo "push=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "push=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Summary
+        run: |
+          echo "tag  = ${{ steps.meta.outputs.tag }}"
+          echo "push = ${{ steps.meta.outputs.push }}"
+          echo "api image rebuild = ${{ needs.paths.outputs.api_image }}"
+          echo "web image rebuild = ${{ needs.paths.outputs.web_image }}"
+
+  # --------------------------------------------------------------------------
+  # 6a. API images -- `runtime` (serves traffic) and `migrate` (the Prisma CLI).
+  #
+  #     Both come out of docker/Dockerfile.api and share every layer up to
+  #     `build`, so building them in one job is one dependency install, not
+  #     two. They MUST carry the same tag: the migration that runs and the
+  #     code that serves must never disagree about which commit they are.
+  # --------------------------------------------------------------------------
+  image-api:
+    name: api image (build + scan + push)
+    needs: image-meta
+    if: needs.image-meta.outputs.api == 'true'
+    runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write    # to push to GHCR
+    env:
+      TAG: ${{ needs.image-meta.outputs.tag }}
+      API_REF: ${{ format('{0}/{1}/baseplate-api:{2}', 'ghcr.io', github.repository_owner, needs.image-meta.outputs.tag) }}
+      MIGRATE_REF: ${{ format('{0}/{1}/baseplate-migrate:{2}', 'ghcr.io', github.repository_owner, needs.image-meta.outputs.tag) }}
     steps:
       - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
-
-      - uses: docker/setup-qemu-action@49b3bc8e6bdd4a60e6116a5414239cba5943d3cf # v3.2.0
 
       - uses: docker/setup-buildx-action@988b5a0280414f521da01fcc63a27aeeb4b104db # v3.6.1
 
@@ -397,29 +478,50 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # The CI build is load-only (push:false by default). CD pushes the same
-      # images with the same SHA tag -- gating is at the workflow_run level,
-      # not at the build level. See docs/adr/0008.
-      - name: Build API
+      # ONE buildx invocation per image, for both PR and release. The exporter
+      # is what changes:
+      #   push=true  -> registry exporter, with provenance + SBOM attestations.
+      #   push=false -> docker exporter (`load`), so Trivy has something local
+      #                 to scan. Attestations are turned OFF in that mode: they
+      #                 make the result an image index, and the runner's classic
+      #                 image store cannot import one ("docker exporter does not
+      #                 currently support exporting manifest lists").
+      - name: Build API runtime image
         uses: docker/build-push-action@31159d49c0d4756269a0940a750801a1ea5d7003 # v6.1.0
         with:
           context: .
           file: docker/Dockerfile.api
           target: runtime
-          tags: ${{ env.GHCR_REGISTRY }}/${{ env.GHCR_NAMESPACE }}/baseplate-api:sha-${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          # No provenance/sbom here, unlike CD. `load: true` uses the docker
-          # exporter, and attestations turn the result into an image index that
-          # the runner's classic image store cannot import ("docker exporter
-          # does not currently support exporting manifest lists"). This image
-          # exists only to be scanned and thrown away; the attested artifact is
-          # the one CD pushes.
-          provenance: false
-          sbom: false
-          load: true
+          tags: ${{ env.API_REF }}
+          cache-from: type=gha,scope=api
+          cache-to: type=gha,mode=max,scope=api
+          push: ${{ needs.image-meta.outputs.push }}
+          load: ${{ needs.image-meta.outputs.push != 'true' }}
+          provenance: ${{ needs.image-meta.outputs.push }}
+          sbom: ${{ needs.image-meta.outputs.push }}
 
-      - name: Scan API image
+      - name: Build migrate image
+        uses: docker/build-push-action@31159d49c0d4756269a0940a750801a1ea5d7003 # v6.1.0
+        with:
+          context: .
+          file: docker/Dockerfile.api
+          target: migrate
+          tags: ${{ env.MIGRATE_REF }}
+          # Same scope as the runtime build above: the two targets share every
+          # layer through `build`, and a separate scope would rebuild them.
+          cache-from: type=gha,scope=api
+          cache-to: type=gha,mode=max,scope=api
+          push: ${{ needs.image-meta.outputs.push }}
+          load: ${{ needs.image-meta.outputs.push != 'true' }}
+          provenance: ${{ needs.image-meta.outputs.push }}
+          sbom: ${{ needs.image-meta.outputs.push }}
+
+      # Trivy resolves the same ref either way: it prefers the local daemon
+      # (the PR path's `load`) and falls back to the registry (the release
+      # path's `push`). TRIVY_USERNAME/PASSWORD cover the registry case --
+      # the action runs Trivy in its own container and does not inherit the
+      # runner's ~/.docker/config.json.
+      - name: Scan API runtime image
         uses: aquasecurity/trivy-action@6e7b7d1fd3e4fef0c5fa8cce1229c54b2c9bd0d8 # 0.24.0
         env:
           # Documented allowlist file for unpatchable transitive CVEs
@@ -434,26 +536,185 @@ jobs:
           # is not an input of this action at all; it was being dropped, which
           # is why the allowlist has never actually applied.)
           TRIVY_IGNOREFILE: .github/trivy-allowlist.yaml
+          TRIVY_USERNAME: ${{ github.actor }}
+          TRIVY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
         with:
-          image-ref: ${{ env.GHCR_REGISTRY }}/${{ env.GHCR_NAMESPACE }}/baseplate-api:sha-${{ github.sha }}
+          image-ref: ${{ env.API_REF }}
           severity: HIGH,CRITICAL
           ignore-unfixed: true
           exit-code: '1'
 
-      - name: Build Web
+      # The migrate image ships the Prisma CLI and its dependency tree -- ~95MB
+      # of code the runtime image deliberately does not carry. Scanning only
+      # the runtime image would leave the image with the LARGER dependency
+      # surface unscanned, and it is the one that holds DDL rights.
+      - name: Scan migrate image
+        uses: aquasecurity/trivy-action@6e7b7d1fd3e4fef0c5fa8cce1229c54b2c9bd0d8 # 0.24.0
+        env:
+          TRIVY_IGNOREFILE: .github/trivy-allowlist.yaml
+          TRIVY_USERNAME: ${{ github.actor }}
+          TRIVY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          image-ref: ${{ env.MIGRATE_REF }}
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: '1'
+
+      - name: Summary
+        run: |
+          {
+            echo "### API images"
+            echo ""
+            echo "- \`${API_REF}\`"
+            echo "- \`${MIGRATE_REF}\`"
+            echo ""
+            echo "pushed: ${{ needs.image-meta.outputs.push }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # --------------------------------------------------------------------------
+  # 6b. Web image (nginx + the built SPA).
+  # --------------------------------------------------------------------------
+  image-web:
+    name: web image (build + scan + push)
+    needs: image-meta
+    if: needs.image-meta.outputs.web == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      WEB_REF: ${{ format('{0}/{1}/baseplate-web:{2}', 'ghcr.io', github.repository_owner, needs.image-meta.outputs.tag) }}
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - uses: docker/setup-buildx-action@988b5a0280414f521da01fcc63a27aeeb4b104db # v3.6.1
+
+      - name: Login to GHCR
+        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
+        with:
+          registry: ${{ env.GHCR_REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build web image
         uses: docker/build-push-action@31159d49c0d4756269a0940a750801a1ea5d7003 # v6.1.0
         with:
           context: .
           file: docker/Dockerfile.web
-          tags: ${{ env.GHCR_REGISTRY }}/${{ env.GHCR_NAMESPACE }}/baseplate-web:sha-${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          target: runtime
+          tags: ${{ env.WEB_REF }}
+          # VITE_API_URL is baked at BUILD time (Vite inlines it), so it is a
+          # build-arg and not runtime config. '/api' keeps the browser
+          # same-origin behind nginx -- see compose.prod.yaml.
           build-args: VITE_API_URL=/api
+          cache-from: type=gha,scope=web
+          cache-to: type=gha,mode=max,scope=web
+          push: ${{ needs.image-meta.outputs.push }}
+          load: ${{ needs.image-meta.outputs.push != 'true' }}
+          provenance: ${{ needs.image-meta.outputs.push }}
+          sbom: ${{ needs.image-meta.outputs.push }}
 
-      # Surface the immutable tag in the job log so the Actions UI can show
-      # which SHA was just scanned. CD reads `workflow_run.head_sha` directly
-      # and re-derives the short SHA itself; the CI job does not pass tags.
-      - name: Surface image tags
+      # The web image was previously built and never scanned. It is the ONLY
+      # published service in the stack, so its base image is the one an
+      # attacker can reach without going through anything else.
+      - name: Scan web image
+        uses: aquasecurity/trivy-action@6e7b7d1fd3e4fef0c5fa8cce1229c54b2c9bd0d8 # 0.24.0
+        env:
+          TRIVY_IGNOREFILE: .github/trivy-allowlist.yaml
+          TRIVY_USERNAME: ${{ github.actor }}
+          TRIVY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          image-ref: ${{ env.WEB_REF }}
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: '1'
+
+      - name: Summary
         run: |
-          echo "API tag: sha-${{ github.sha }}"
-          echo "Web tag: sha-${{ github.sha }}"
+          {
+            echo "### Web image"
+            echo ""
+            echo "- \`${WEB_REF}\`"
+            echo ""
+            echo "pushed: ${{ needs.image-meta.outputs.push }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # --------------------------------------------------------------------------
+  # 6c. Tag promotion. Release path only.
+  #
+  #     compose.prod.yaml resolves api, web AND migrate from a single
+  #     ${IMAGE_TAG}. Path-gated builds break that: a web-only commit leaves
+  #     baseplate-api:sha-<new> nonexistent, and the deploy fails on a pull.
+  #
+  #     So for any image NOT rebuilt this run, copy the manifest that :latest
+  #     already points at onto the new SHA tag. `imagetools create` is a
+  #     registry-side manifest copy -- no pull, no push, no rebuild, and the
+  #     digest is unchanged, so "same tag, same bytes" still holds.
+  #
+  #     Only then does :latest move. A scan that fails leaves :latest on the
+  #     last image that passed.
+  # --------------------------------------------------------------------------
+  image-promote:
+    name: promote image tags
+    needs: [image-meta, image-api, image-web]
+    if: >
+      !cancelled()
+      && !contains(needs.*.result, 'failure')
+      && needs.image-meta.outputs.push == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      TAG: ${{ needs.image-meta.outputs.tag }}
+      REPOS: baseplate-api baseplate-migrate baseplate-web
+    steps:
+      - uses: docker/setup-buildx-action@988b5a0280414f521da01fcc63a27aeeb4b104db # v3.6.1
+
+      - name: Login to GHCR
+        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
+        with:
+          registry: ${{ env.GHCR_REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Backfill the SHA tag for images that were not rebuilt
+        run: |
+          set -euo pipefail
+          for repo in $REPOS; do
+            ref="${GHCR_REGISTRY}/${GHCR_NAMESPACE}/${repo}"
+            if docker buildx imagetools inspect "${ref}:${TAG}" >/dev/null 2>&1; then
+              echo "==> ${repo}: built in this run"
+              continue
+            fi
+            echo "==> ${repo}: unchanged, copying :latest -> :${TAG}"
+            if ! docker buildx imagetools inspect "${ref}:latest" >/dev/null 2>&1; then
+              echo "ERROR: ${repo} has neither :${TAG} nor :latest." >&2
+              echo "       Nothing to deploy. Re-run CI with an empty commit" >&2
+              echo "       touching docker/ to force a full image build." >&2
+              exit 1
+            fi
+            docker buildx imagetools create --tag "${ref}:${TAG}" "${ref}:latest"
+          done
+
+      # :latest moves LAST and only on a fully green run. It is a convenience
+      # for `docker compose pull` on a dev box; it is NEVER deployed, because
+      # a rollback needs a coordinate that does not move [ADR-0003].
+      - name: Move :latest to this SHA
+        run: |
+          set -euo pipefail
+          for repo in $REPOS; do
+            ref="${GHCR_REGISTRY}/${GHCR_NAMESPACE}/${repo}"
+            docker buildx imagetools create --tag "${ref}:latest" "${ref}:${TAG}"
+            echo "==> ${repo}:latest -> ${TAG}"
+          done
+
+      - name: Summary
+        run: |
+          {
+            echo "### Deployable tag"
+            echo ""
+            echo '`IMAGE_TAG='"${TAG}"'`'
+            echo ""
+            echo "CD deploys this tag. It does not rebuild."
+          } >> "$GITHUB_STEP_SUMMARY"

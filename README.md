@@ -148,31 +148,42 @@ For deployment verification, use the real GitHub Actions run.
 
 ## Deployment
 
-Push to `main` triggers CI; CI passing triggers CD. The CD workflow:
+The target is a single AWS EC2 instance. First-time setup — instance,
+IAM roles, OIDC provider — is
+**[docs/deploy-aws-ec2.md](docs/deploy-aws-ec2.md)**.
 
-1. Builds and pushes API and web images to GHCR, tagged with both
-   `sha-<short-sha>` and `latest`. Deployments reference the immutable
-   SHA.
-2. SSHes to the deploy host.
-3. `prisma migrate deploy` first (the running app is backward-compatible
-   with the OLD schema by design).
-4. `docker compose up -d`.
-5. Polls `/api/ready` until 200 or 30 attempts.
+Push to `main` triggers CI; a green CI triggers CD.
 
-Required secrets on the repo:
-- `DEPLOY_HOST`, `DEPLOY_USER`, `DEPLOY_SSH_KEY` — for the SSH deploy.
-- `PUBLIC_URL` — for the GitHub environment URL.
+**CI** owns the image lifecycle: it builds, Trivy-scans and pushes
+`baseplate-api`, `baseplate-migrate` and `baseplate-web` to GHCR, tagged
+with the immutable `sha-<short-sha>`, then moves `latest`. Image jobs
+are path-gated, so an API-only commit does not rebuild the web image.
+
+**CD** builds nothing ([ADR-0009](docs/adr/0009-images-built-once-in-ci.md)):
+
+1. Verifies the tag CI published exists in GHCR.
+2. Assumes an AWS role via **OIDC** — no stored AWS key, no SSH key.
+3. Runs `scripts/deploy.sh --pull` on the instance via **SSM Run
+   Command** — no inbound port 22
+   ([ADR-0010](docs/adr/0010-oidc-ssm-deploy-to-ec2.md)).
+4. On the host: pull → `up -d` → wait healthy → `prisma migrate deploy`
+   → poll `/api/ready`. Migrations are a deliberate separate step, and
+   the running app is backward-compatible with the OLD schema by design.
+5. Polls `${PUBLIC_URL}/api/ready` from outside the VPC.
+
+Required configuration on the `production` GitHub environment:
+
+| | |
+| --- | --- |
+| secret `AWS_ROLE_ARN` | the role CD assumes via OIDC |
+| variable `AWS_REGION`, `EC2_INSTANCE_ID` | the deploy target |
+| variable `PUBLIC_URL` | the environment URL, and the external health check |
 
 ### Rollback
 
-```bash
-# On the deploy host:
-docker compose -p baseplate-prod -f docker/compose.prod.yaml --env-file .env pull
-IMAGE_TAG=sha-abc1234 docker compose -p baseplate-prod -f docker/compose.prod.yaml \
-  --env-file .env up -d
-```
-
-Full rollback procedure in `docs/runbook.md`.
+Redeploy the previous tag: **Actions → cd → Run workflow**, `tag:
+sha-9f2c1ab`. Full procedure, including the Actions-is-down path, in
+[docs/runbook.md](docs/runbook.md#rollback).
 
 ## Hackathon start
 

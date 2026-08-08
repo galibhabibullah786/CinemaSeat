@@ -26,18 +26,37 @@ if [ ! -f .env ]; then
   exit 1
 fi
 
+# A caller-supplied IMAGE_TAG must WIN over the one in .env.
+#
+# `. ./.env` executes `IMAGE_TAG=latest` (see .env.example), which silently
+# overwrites an exported IMAGE_TAG -- so `IMAGE_TAG=sha-abc1234 deploy.sh`
+# would deploy `latest` instead. That is exactly the failure the immutable
+# tag exists to prevent: the deploy log says sha-abc1234, the host runs
+# whatever `latest` points at, and a rollback has nothing to roll back to.
+IMAGE_TAG_OVERRIDE="${IMAGE_TAG:-}"
+
 # shellcheck disable=SC1091
 set -a; . ./.env; set +a
+
+[ -n "$IMAGE_TAG_OVERRIDE" ] && IMAGE_TAG="$IMAGE_TAG_OVERRIDE"
+# Exported so compose interpolation picks it up: shell environment takes
+# precedence over --env-file, which is what makes the override effective.
+export IMAGE_TAG="${IMAGE_TAG:-latest}"
 
 WEB_PORT="${WEB_PORT:-8080}"
 READY_URL="http://localhost:${WEB_PORT}/api/ready"
 
-echo "==> deploying tag '${IMAGE_TAG:-latest}'"
+echo "==> deploying tag '${IMAGE_TAG}'"
 
 if [ "$PULL" = "1" ]; then
   # Pull BEFORE stopping anything: a failed pull must not leave the site down.
+  #
+  # --profile migrate is required: `compose pull` only touches services in
+  # ENABLED profiles, so without it baseplate-migrate is never fetched and the
+  # migrate step below falls back to building it from source on the production
+  # host -- slow, and it would be a different artifact from the one CI scanned.
   echo "==> pulling images"
-  "${COMPOSE[@]}" pull
+  "${COMPOSE[@]}" --profile migrate pull
 else
   echo "==> building images"
   "${COMPOSE[@]}" build

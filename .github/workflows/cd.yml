@@ -1,24 +1,24 @@
 # ============================================================================
-#  CD -- build & push to GHCR, deploy over SSH, migrate, poll /ready.
+#  CD -- deploy the images CI already built, to an AWS EC2 instance.
 #
-#  Trigger: workflow_run on the `ci` workflow completing successfully, OR a
-#  manual dispatch. CD NEVER starts on a raw `push` -- doing so would race
-#  the CI workflow for the same SHA and could publish images from a commit
-#  whose checks had not finished yet. The `workflow_run` event fires AFTER
-#  the CI run has reached a terminal state, so a green CI is the single
-#  pre-requisite for a deploy.
+#  This workflow BUILDS NOTHING. `ci.yml` builds, scans and pushes every
+#  image exactly once; CD resolves the tag CI published, verifies it exists,
+#  and rolls it out. See docs/adr/0009.
 #
-#  Tagging: images are tagged with BOTH `sha-<short-sha>` (immutable, what we
-#  deploy) and `latest` (a convenience for local `docker compose pull`). The
-#  deploy references the SHA tag. `latest` MUST NOT be deployed -- rollback
-#  would be impossible because "latest" has moved.
+#  Trigger: workflow_run on the `ci` workflow completing successfully for a
+#  PUSH TO MAIN, or a manual dispatch. CD never starts on a raw `push` --
+#  doing so would race the CI workflow for the same SHA. The `workflow_run`
+#  event fires AFTER the CI run has reached a terminal state, so a green CI
+#  is the single pre-requisite for a deploy [ADR-0008].
 #
-#  Fork safety: workflow_run inherits the source workflow's trust boundary. A
-#  fork PR can never satisfy it because the `ci` workflow refuses to run the
-#  GHCR-needing jobs (see ci.yml).
+#  Transport: AWS Systems Manager Run Command over an OIDC-federated role.
+#  No AWS access keys, no SSH private key, no inbound port 22 -- the EC2
+#  instance needs no ingress at all beyond the web port. The full setup
+#  procedure is docs/deploy-aws-ec2.md.
 #
-#  Alternative deploy path: see `deploy-render` job (commented). Switch in
-#  minutes if the SSH target VM is unavailable.
+#  Fork safety: workflow_run inherits the source workflow's trust boundary,
+#  and the gate below additionally requires the run to have come from a push
+#  to `main`. A fork PR, and an in-repo PR branch, can never satisfy it.
 # ============================================================================
 
 name: cd
@@ -28,12 +28,14 @@ on:
   workflow_run:
     workflows: [ci]
     types: [completed]
-  # Manual path: a human can still kick a deploy from the Actions UI.
+  # Manual path: a human can still kick a deploy from the Actions UI --
+  # a redeploy after an infrastructure change, or a rollback.
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Override IMAGE_TAG (default: sha-<short> of the SHA that triggered CI)'
+        description: 'IMAGE_TAG to deploy, e.g. sha-abc1234 (default: sha-<short> of main HEAD)'
         required: false
+        type: string
 
 concurrency:
   # Only ONE deploy runs at a time. A long deploy + a fast push must NOT
@@ -52,56 +54,103 @@ env:
   GHCR_REGISTRY: ghcr.io
   GHCR_NAMESPACE: ${{ github.repository_owner }}
 
+# Default-deny. `id-token: write` (for OIDC) is declared ONLY on the job that
+# assumes the AWS role -- a workflow-level grant would hand an OIDC token to
+# every job, including ones that only read.
+permissions:
+  contents: read
+
 jobs:
   # --------------------------------------------------------------------------
-  # 0. Gate. Decide whether CD is allowed to proceed based on the CI result.
-  #    A separate, near-empty job keeps the gate logic in one place and makes
-  #    the "why did CD skip?" answer obvious in the Actions UI.
+  # 0. Gate. Decide whether CD is allowed to proceed, and resolve WHAT to
+  #    deploy. A separate, near-empty job keeps the gate logic in one place
+  #    and makes the "why did CD skip?" answer obvious in the Actions UI.
   # --------------------------------------------------------------------------
   gate:
-    name: gate (CI must be green)
+    name: gate (CI green on main)
     runs-on: ubuntu-latest
     permissions: { contents: read }
-    # The `workflow_run` event fires for ALL terminal states (success,
-    # failure, cancelled). Only `success` advances; everything else exits
-    # with a skipped status that fails the downstream `needs` chain.
+    # Three conditions, not one:
+    #   conclusion == success -- `workflow_run` fires for ALL terminal states
+    #                            (failure, cancelled, timed_out) and only
+    #                            success may advance.
+    #   event      == push    -- CI also runs on pull_request. Without this,
+    #                            a green CI on an in-repo PR branch would
+    #                            deploy that branch to production.
+    #   head_branch == main   -- belt and braces; a push to any other branch
+    #                            is not a release [ADR-0003].
     if: >
       github.event_name == 'workflow_dispatch' ||
-      (github.event.workflow_run.conclusion == 'success')
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_branch == 'main')
     outputs:
       head_sha: ${{ steps.resolve.outputs.head_sha }}
       head_branch: ${{ steps.resolve.outputs.head_branch }}
+      image_tag: ${{ steps.resolve.outputs.image_tag }}
     steps:
-      - name: Resolve triggering SHA
+      - name: Resolve triggering SHA and image tag
         id: resolve
+        env:
+          # Read through env rather than interpolating `inputs.tag` into the
+          # script body: a dispatch input is attacker-controllable text and
+          # `${{ }}` inside `run:` is string substitution, not a variable.
+          TAG_INPUT: ${{ inputs.tag }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            HEAD_SHA="${{ github.sha }}"
+          set -euo pipefail
+
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            HEAD_SHA="$GITHUB_SHA"
             HEAD_BRANCH="${GITHUB_REF#refs/heads/}"
           else
             HEAD_SHA="${{ github.event.workflow_run.head_sha }}"
             HEAD_BRANCH="${{ github.event.workflow_run.head_branch }}"
           fi
-          echo "head_sha=${HEAD_SHA}"        >> "$GITHUB_OUTPUT"
-          echo "head_branch=${HEAD_BRANCH}"  >> "$GITHUB_OUTPUT"
-          echo "Deploying branch=${HEAD_BRANCH} sha=${HEAD_SHA}"
 
-  build-and-push:
-    name: build + push images
+          # The tag CI published for this SHA. Short (7), matching ci.yml's
+          # image-meta job, scripts/deploy.sh and the runbook.
+          IMAGE_TAG="sha-$(echo "$HEAD_SHA" | cut -c1-7)"
+
+          if [ -n "${TAG_INPUT:-}" ]; then
+            # Anchored allowlist. This value is interpolated into a shell
+            # command that runs as root on the production host, so it is
+            # validated here rather than trusted anywhere downstream.
+            if ! printf '%s' "$TAG_INPUT" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$'; then
+              echo "ERROR: refusing tag '${TAG_INPUT}' -- not a valid image tag." >&2
+              exit 1
+            fi
+            IMAGE_TAG="$TAG_INPUT"
+          fi
+
+          {
+            echo "head_sha=${HEAD_SHA}"
+            echo "head_branch=${HEAD_BRANCH}"
+            echo "image_tag=${IMAGE_TAG}"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Deploying branch=${HEAD_BRANCH} sha=${HEAD_SHA} tag=${IMAGE_TAG}"
+
+  # --------------------------------------------------------------------------
+  # 1. Verify the images exist. NO BUILD.
+  #
+  #    CI is the only place that builds, scans and pushes [ADR-0009]. This
+  #    job is the contract check: if the tag is not in GHCR, fail here with a
+  #    clear message rather than on the production host, half way through a
+  #    `compose pull`, with the old containers already stopped.
+  # --------------------------------------------------------------------------
+  verify-images:
+    name: verify published images
     needs: gate
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write
+      packages: read
+    env:
+      IMAGE_TAG: ${{ needs.gate.outputs.image_tag }}
+      REPOS: baseplate-api baseplate-migrate baseplate-web
     outputs:
-      sha_tag: ${{ steps.tag.outputs.sha }}
+      image_tag: ${{ needs.gate.outputs.image_tag }}
     steps:
-      - name: Checkout triggering SHA
-        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
-        with:
-          ref: ${{ needs.gate.outputs.head_sha }}
-          fetch-depth: 1
-
       - uses: docker/setup-buildx-action@988b5a0280414f521da01fcc63a27aeeb4b104db # v3.6.1
 
       - name: Login to GHCR
@@ -111,87 +160,240 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Compute short SHA
-        id: tag
-        run: echo "sha=sha-$(echo ${{ needs.gate.outputs.head_sha }} | cut -c1-7)" >> "$GITHUB_OUTPUT"
-
-      - name: Build + push API
-        uses: docker/build-push-action@31159d49c0d4756269a0940a750801a1ea5d7003 # v6.1.0
-        with:
-          context: .
-          file: docker/Dockerfile.api
-          target: runtime
-          tags: |
-            ${{ env.GHCR_REGISTRY }}/${{ env.GHCR_NAMESPACE }}/baseplate-api:${{ steps.tag.outputs.sha }}
-            ${{ env.GHCR_REGISTRY }}/${{ env.GHCR_NAMESPACE }}/baseplate-api:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          provenance: true
-          sbom: true
-          push: true
-
-      - name: Build + push web
-        uses: docker/build-push-action@31159d49c0d4756269a0940a750801a1ea5d7003 # v6.1.0
-        with:
-          context: .
-          file: docker/Dockerfile.web
-          tags: |
-            ${{ env.GHCR_REGISTRY }}/${{ env.GHCR_NAMESPACE }}/baseplate-web:${{ steps.tag.outputs.sha }}
-            ${{ env.GHCR_REGISTRY }}/${{ env.GHCR_NAMESPACE }}/baseplate-web:latest
-          build-args: VITE_API_URL=/api
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          push: true
-
-  deploy-ssh:
-    name: deploy (SSH -> compose)
-    needs: build-and-push
-    runs-on: ubuntu-latest
-    environment:
-      name: production
-      url: ${{ steps.ready.outputs.url }}
-    steps:
-      # The remote runs the same scripts/deploy.sh the runbook points
-      # operators at. One deploy sequence, local and automated.
-      - name: Deploy over SSH
-        uses: appleboy/ssh-action@029f5b4aeeeb58fdfe1410a5d17f967dacf36262 # v1.0.3
-        with:
-          host: ${{ secrets.DEPLOY_HOST }}
-          username: ${{ secrets.DEPLOY_USER }}
-          key: ${{ secrets.DEPLOY_SSH_KEY }}
-          script: |
-            set -euo pipefail
-            cd /opt/baseplate
-            export IMAGE_TAG="${{ needs.build-and-push.outputs.sha_tag }}"
-            bash scripts/deploy.sh --pull
-
-      - name: Record public URL
-        id: ready
+      - name: Assert every image exists at this tag
         run: |
-          url="${{ secrets.PUBLIC_URL }}"
-          if [ -z "$url" ]; then url="https://${{ secrets.DEPLOY_HOST }}"; fi
-          echo "url=$url" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          missing=0
+          for repo in $REPOS; do
+            ref="${GHCR_REGISTRY}/${GHCR_NAMESPACE}/${repo}:${IMAGE_TAG}"
+            if docker buildx imagetools inspect "$ref" >/dev/null 2>&1; then
+              digest=$(docker buildx imagetools inspect "$ref" --format '{{.Manifest.Digest}}')
+              echo "==> OK  ${ref}  ${digest}"
+            else
+              echo "==> MISSING  ${ref}" >&2
+              missing=1
+            fi
+          done
+          if [ "$missing" = "1" ]; then
+            echo "" >&2
+            echo "CD does not build images -- ci.yml does (ADR-0009)." >&2
+            echo "Check the ci run for this SHA: the image-promote job is what" >&2
+            echo "guarantees all three tags exist. It is skipped on PRs." >&2
+            exit 1
+          fi
 
   # --------------------------------------------------------------------------
-  # Alternative deploy path: Render. Commented out; flip in minutes if the VM
-  # is unavailable. Uncomment + remove the deploy-ssh job above.
+  # 2. Deploy to EC2 over SSM Run Command, authenticated with OIDC.
+  #
+  #    Why not SSH: an SSH deploy needs a long-lived private key in
+  #    `secrets`, a user on the box that key maps to, and port 22 open to
+  #    GitHub's runner IP range (which is large and changes). SSM needs none
+  #    of those -- the instance's SSM agent polls OUTBOUND, so the security
+  #    group can have zero inbound rules for the deploy path, and the
+  #    credential is a 1-hour token minted per run by AWS STS from a GitHub
+  #    OIDC assertion. Nothing reusable is stored anywhere.
+  #
+  #    Setup (roles, trust policy, instance profile, /opt/baseplate):
+  #    docs/deploy-aws-ec2.md.
   # --------------------------------------------------------------------------
-  # deploy-render:
-  #   name: deploy (Render)
-  #   needs: build-and-push
+  deploy-ec2:
+    name: deploy (OIDC -> SSM -> EC2)
+    needs: verify-images
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write    # mint the OIDC token configure-aws-credentials exchanges
+    environment:
+      # Scopes AWS_ROLE_ARN / EC2_INSTANCE_ID to this environment, and is the
+      # hook for a required-reviewer rule if a human gate is ever wanted.
+      name: production
+      url: ${{ vars.PUBLIC_URL }}
+    env:
+      IMAGE_TAG: ${{ needs.verify-images.outputs.image_tag }}
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
+      DEPLOY_DIR: ${{ vars.DEPLOY_DIR || '/opt/baseplate' }}
+      PUBLIC_URL: ${{ vars.PUBLIC_URL }}
+    steps:
+      - name: Check deploy configuration
+        run: |
+          set -euo pipefail
+          for v in AWS_REGION INSTANCE_ID; do
+            if [ -z "${!v:-}" ]; then
+              echo "ERROR: repository/environment variable ${v} is not set." >&2
+              echo "See docs/deploy-aws-ec2.md -> 'Wire up GitHub'." >&2
+              exit 1
+            fi
+          done
+          echo "region=${AWS_REGION} instance=${INSTANCE_ID} tag=${IMAGE_TAG}"
+
+      # Exchanges the job's OIDC token for short-lived STS credentials. No
+      # AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY exists in this repository.
+      - name: Assume the deploy role via OIDC
+        uses: aws-actions/configure-aws-credentials@b47578312673ae6fa5b5096b330d9fbac3d116df # v4.2.1
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: gha-cd-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+          # Default is 1h; a deploy that takes longer than 20 minutes has
+          # already failed the /ready poll.
+          role-duration-seconds: 1800
+
+      - name: Confirm the assumed identity
+        run: aws sts get-caller-identity
+
+      # The remote script is assembled with jq, never by string-concatenating
+      # `${{ }}` into a shell heredoc: the SSM payload is JSON, and a value
+      # containing a quote would otherwise break out of the command array.
+      # IMAGE_TAG is additionally allowlisted in the gate job.
+      - name: Send deploy command
+        id: send
+        env:
+          GHCR_USERNAME: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+
+          read -r -d '' SCRIPT <<'REMOTE' || true
+          set -euo pipefail
+
+          echo "==> baseplate deploy: tag=${IMAGE_TAG} dir=${DEPLOY_DIR}"
+          cd "${DEPLOY_DIR}"
+
+          # GHCR credentials live in SSM Parameter Store as a SecureString and
+          # are read with the INSTANCE's own role -- they are never passed
+          # through this command document, which is logged in CloudTrail.
+          # Skipped when the packages are public.
+          if token=$(aws ssm get-parameter --name /baseplate/ghcr-token \
+                       --with-decryption --query Parameter.Value --output text 2>/dev/null); then
+            echo "$token" | docker login ghcr.io -u "${GHCR_USERNAME}" --password-stdin
+            unset token
+          else
+            echo "==> no /baseplate/ghcr-token parameter; assuming public packages"
+          fi
+
+          # scripts/deploy.sh is the SAME sequence the runbook points operators
+          # at: pull -> up -> wait healthy -> migrate -> poll /ready. One deploy
+          # path, whether a pipeline or a human runs it.
+          export IMAGE_TAG="${IMAGE_TAG}"
+          bash scripts/deploy.sh --pull
+          REMOTE
+
+          # Substitute only the three values the remote script needs. The
+          # restricted form of envsubst means every other '$' in the script
+          # ($token, and anything the shell should expand on the host) is
+          # left untouched.
+          # shellcheck disable=SC2016  # the single quotes are the point:
+          # envsubst takes the NAMES to expand, it must not see their values.
+          SCRIPT=$(printf '%s' "$SCRIPT" | envsubst '${IMAGE_TAG} ${DEPLOY_DIR} ${GHCR_USERNAME}')
+
+          params=$(jq -n --arg s "$SCRIPT" \
+            '{commands: ($s | split("\n")), executionTimeout: ["900"]}')
+
+          command_id=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name AWS-RunShellScript \
+            --comment "baseplate cd ${IMAGE_TAG}" \
+            --parameters "$params" \
+            --timeout-seconds 600 \
+            --query Command.CommandId --output text)
+
+          echo "command_id=${command_id}" >> "$GITHUB_OUTPUT"
+          echo "SSM command: ${command_id}"
+
+      - name: Wait for the deploy to finish
+        env:
+          COMMAND_ID: ${{ steps.send.outputs.command_id }}
+        run: |
+          set -euo pipefail
+
+          # `wait command-executed` exits non-zero on a failed invocation. We
+          # want the remote stdout/stderr in the log either way, so the exit
+          # code is captured and the status is read explicitly below.
+          aws ssm wait command-executed \
+            --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" || true
+
+          invocation=$(aws ssm get-command-invocation \
+            --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID")
+
+          status=$(printf '%s' "$invocation" | jq -r '.Status')
+
+          echo "---------------- remote stdout ----------------"
+          printf '%s' "$invocation" | jq -r '.StandardOutputContent'
+          echo "---------------- remote stderr ----------------"
+          printf '%s' "$invocation" | jq -r '.StandardErrorContent'
+          echo "----------------------------------------------"
+          echo "SSM status: ${status}"
+
+          if [ "$status" != "Success" ]; then
+            echo "" >&2
+            echo "DEPLOY FAILED (${status})." >&2
+            echo "The previous release is still running -- deploy.sh pulls" >&2
+            echo "before it stops anything. Roll back with a workflow_dispatch" >&2
+            echo "on this workflow and the previous sha- tag." >&2
+            echo "See docs/runbook.md -> Rollback." >&2
+            exit 1
+          fi
+
+      # deploy.sh already polled /ready from INSIDE the host. This polls it
+      # from outside, over the public URL, which is the only check that also
+      # proves the security group and DNS still work.
+      - name: Verify the public endpoint
+        if: env.PUBLIC_URL != ''
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 20); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "${PUBLIC_URL}/api/ready" || true)
+            if [ "$code" = "200" ]; then
+              echo "==> ${PUBLIC_URL}/api/ready healthy after ${attempt} attempt(s)"
+              exit 0
+            fi
+            echo "    attempt ${attempt}: ${code:-no response}"
+            sleep 3
+          done
+          echo "ERROR: ${PUBLIC_URL}/api/ready never returned 200." >&2
+          exit 1
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Deploy"
+            echo ""
+            echo "| | |"
+            echo "| --- | --- |"
+            echo "| tag | \`${IMAGE_TAG}\` |"
+            echo "| instance | \`${INSTANCE_ID}\` |"
+            echo "| region | \`${AWS_REGION}\` |"
+            echo "| url | ${PUBLIC_URL:-n/a} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # --------------------------------------------------------------------------
+  # Alternative deploy path: SSH. Kept commented as the break-glass transport
+  # for the case where the SSM agent on the instance is unreachable (it is the
+  # one component of the primary path with no fallback of its own).
+  #
+  # It needs three secrets the OIDC path does not: DEPLOY_HOST, DEPLOY_USER,
+  # DEPLOY_SSH_KEY -- plus port 22 reachable from GitHub's runners. Do not
+  # leave both paths enabled; that is two credentials to rotate for one job.
+  # --------------------------------------------------------------------------
+  # deploy-ssh:
+  #   name: deploy (SSH -> compose)
+  #   needs: verify-images
   #   runs-on: ubuntu-latest
+  #   environment:
+  #     name: production
+  #     url: ${{ vars.PUBLIC_URL }}
   #   steps:
-  #     - name: Trigger Render deploy
-  #       run: |
-  #         curl -fsS -X POST "${{ secrets.RENDER_DEPLOY_HOOK }}" \
-  #           -H "Accept: application/json" \
-  #           -d "{\"imageTag\":\"${{ needs.build-and-push.outputs.sha_tag }}\"}"
-  #     - name: Poll /ready
-  #       run: |
-  #         for attempt in $(seq 1 30); do
-  #           code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "${{ secrets.PUBLIC_URL }}/api/ready" || true)
-  #           [ "$code" = "200" ] && exit 0
-  #           sleep 3
-  #         done
-  #         echo "Render deploy did not become healthy in time" >&2
-  #         exit 1
+  #     - name: Deploy over SSH
+  #       uses: appleboy/ssh-action@029f5b4aeeeb58fdfe1410a5d17f967dacf36262 # v1.0.3
+  #       with:
+  #         host: ${{ secrets.DEPLOY_HOST }}
+  #         username: ${{ secrets.DEPLOY_USER }}
+  #         key: ${{ secrets.DEPLOY_SSH_KEY }}
+  #         envs: IMAGE_TAG
+  #         script: |
+  #           set -euo pipefail
+  #           cd /opt/baseplate
+  #           bash scripts/deploy.sh --pull
+  #       env:
+  #         IMAGE_TAG: ${{ needs.verify-images.outputs.image_tag }}
