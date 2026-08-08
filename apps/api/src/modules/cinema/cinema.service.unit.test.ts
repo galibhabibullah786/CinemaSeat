@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { CreateBookingBodySchema } from '@baseplate/contracts';
 
 import { SeatUnavailableError } from '../../domain/errors.js';
 import type {
@@ -21,6 +22,23 @@ const mockLogger: any = {
 };
 
 const fakeEnv = { HOLD_TTL_SECONDS: 600 };
+
+describe('CreateBookingBodySchema', () => {
+  it('normalizes the legacy seatId field to canonical seatIds', () => {
+    expect(CreateBookingBodySchema.parse({ showtimeId: 'showtime-1', seatId: 'seat-1' })).toEqual({
+      showtimeId: 'showtime-1',
+      seatIds: ['seat-1'],
+    });
+  });
+
+  it('rejects requests that mix legacy and canonical seat fields', () => {
+    expect(CreateBookingBodySchema.safeParse({
+      showtimeId: 'showtime-1',
+      seatId: 'seat-1',
+      seatIds: ['seat-2'],
+    }).success).toBe(false);
+  });
+});
 
 class InMemoryCinemaRepository implements CinemaRepository {
   movies: MovieRecord[] = [
@@ -87,6 +105,23 @@ class InMemoryCinemaRepository implements CinemaRepository {
         priceCents: 1500,
       },
     },
+    {
+      id: 'inv-3',
+      showtimeId: 'st-dune-1',
+      seatId: 'seat-3',
+      status: 'AVAILABLE',
+      priceCents: 2000,
+      heldUntil: null,
+      holdingBookingId: null,
+      updatedAt: new Date(),
+      seat: {
+        id: 'seat-3',
+        rowLabel: 'A',
+        seatNumber: 3,
+        seatClass: 'VIP',
+        priceCents: 2000,
+      },
+    },
   ];
 
   bookings = new Map<string, BookingRecord>();
@@ -136,7 +171,6 @@ class InMemoryCinemaRepository implements CinemaRepository {
   }
 
   createBookingRecord(_db: any, data: CreateBookingData): Promise<BookingRecord> {
-    const inv = this.inventories.find((i) => i.showtimeId === data.showtimeId && i.seatId === data.seatId);
     const rec: BookingRecord = {
       id: data.id ?? `b-${data.ref}`,
       ref: data.ref,
@@ -150,16 +184,19 @@ class InMemoryCinemaRepository implements CinemaRepository {
       createdAt: new Date(),
       updatedAt: new Date(),
       showtime: this.showtimes.find((s) => s.id === data.showtimeId),
-      bookingSeats: inv
-        ? [
-            {
-              id: `bs-${data.ref}`,
-              seatId: data.seatId,
-              priceCents: data.seatPriceCents,
-              seat: inv.seat,
-            },
-          ]
-        : [],
+      bookingSeats: data.seats.flatMap((seat, index) => {
+        const inventory = this.inventories.find(
+          (item) => item.showtimeId === data.showtimeId && item.seatId === seat.seatId,
+        );
+        return inventory
+          ? [{
+              id: `bs-${data.ref}-${index}`,
+              seatId: seat.seatId,
+              priceCents: seat.priceCents,
+              seat: inventory.seat,
+            }]
+          : [];
+      }),
     };
     this.bookings.set(data.ref, rec);
     return Promise.resolve(rec);
@@ -207,28 +244,41 @@ describe('CinemaService', () => {
     const repo = new InMemoryCinemaRepository();
     const service = new CinemaService({ db: fakeDb(), cinema: repo, logger: mockLogger, env: fakeEnv });
 
-    const booking = await service.createBooking({ showtimeId: 'st-dune-1', seatId: 'seat-1' });
+    const booking = await service.createBooking({ showtimeId: 'st-dune-1', seatIds: ['seat-1'] });
     expect(booking.status).toBe('HELD');
     expect(booking.amountCents).toBe(1500);
     expect(booking.ref).toMatch(/^CS-\d{4}-\d+/);
+  });
+
+  it('holds every selected seat and totals their prices', async () => {
+    const repo = new InMemoryCinemaRepository();
+    const service = new CinemaService({ db: fakeDb(), cinema: repo, logger: mockLogger, env: fakeEnv });
+
+    const booking = await service.createBooking({
+      showtimeId: 'st-dune-1',
+      seatIds: ['seat-1', 'seat-3'],
+    });
+
+    expect(booking.seats?.map((seat) => seat.id)).toEqual(['seat-1', 'seat-3']);
+    expect(booking.amountCents).toBe(3500);
   });
 
   it('second hold on the same seat returns 409 SEAT_UNAVAILABLE', async () => {
     const repo = new InMemoryCinemaRepository();
     const service = new CinemaService({ db: fakeDb(), cinema: repo, logger: mockLogger, env: fakeEnv });
 
-    await service.createBooking({ showtimeId: 'st-dune-1', seatId: 'seat-1' });
-    await expect(service.createBooking({ showtimeId: 'st-dune-1', seatId: 'seat-1' })).rejects.toThrow(SeatUnavailableError);
+    await service.createBooking({ showtimeId: 'st-dune-1', seatIds: ['seat-1'] });
+    await expect(service.createBooking({ showtimeId: 'st-dune-1', seatIds: ['seat-1'] })).rejects.toThrow(SeatUnavailableError);
   });
 
   it('early release makes the seat available again', async () => {
     const repo = new InMemoryCinemaRepository();
     const service = new CinemaService({ db: fakeDb(), cinema: repo, logger: mockLogger, env: fakeEnv });
 
-    const b1 = await service.createBooking({ showtimeId: 'st-dune-1', seatId: 'seat-1' });
+    const b1 = await service.createBooking({ showtimeId: 'st-dune-1', seatIds: ['seat-1'] });
     await service.releaseHold(b1.ref);
 
-    const b2 = await service.createBooking({ showtimeId: 'st-dune-1', seatId: 'seat-1' });
+    const b2 = await service.createBooking({ showtimeId: 'st-dune-1', seatIds: ['seat-1'] });
     expect(b2.status).toBe('HELD');
   });
 });

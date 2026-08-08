@@ -123,12 +123,7 @@ export class PrismaCinemaRepository implements CinemaRepository {
         currency: data.currency,
         expiresAt: data.expiresAt,
         bookingSeats: {
-          create: [
-            {
-              seatId: data.seatId,
-              priceCents: data.seatPriceCents,
-            },
-          ],
+          create: data.seats,
         },
       },
       include: {

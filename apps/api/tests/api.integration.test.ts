@@ -216,10 +216,13 @@ describe('POST /bookings & hold ownership', () => {
       data: { id: 't1', name: 'Test Theatre' },
     });
     const screen = await screenTable.create({
-      data: { id: 'sc1', theatreId: theatre.id, name: 'Screen 1', capacity: 1 },
+      data: { id: 'sc1', theatreId: theatre.id, name: 'Screen 1', capacity: 2 },
     });
     const seat = await seatTable.create({
       data: { id: 'seat1', screenId: screen.id, rowLabel: 'A', seatNumber: 1, priceCents: 1500 },
+    });
+    const secondSeat = await seatTable.create({
+      data: { id: 'seat2', screenId: screen.id, rowLabel: 'A', seatNumber: 2, priceCents: 2000 },
     });
     const showtime = await showtimeTable.create({
       data: {
@@ -235,8 +238,11 @@ describe('POST /bookings & hold ownership', () => {
     await seatInventoryTable.create({
       data: { showtimeId: showtime.id, seatId: seat.id, status: 'AVAILABLE', priceCents: 1500 },
     });
+    await seatInventoryTable.create({
+      data: { showtimeId: showtime.id, seatId: secondSeat.id, status: 'AVAILABLE', priceCents: 2000 },
+    });
 
-    return { showtimeId: showtime.id, seatId: seat.id };
+    return { showtimeId: showtime.id, seatId: seat.id, secondSeatId: secondSeat.id };
   }
 
   it('first hold succeeds and sets holdingBookingId', async () => {
@@ -264,6 +270,44 @@ describe('POST /bookings & hold ownership', () => {
     const second = await request(app).post('/bookings').send({ showtimeId, seatId });
     expect(second.status).toBe(409);
     expect(second.body.error.code).toBe('SEAT_UNAVAILABLE');
+  });
+
+  it('holds multiple seats in one booking and totals their prices', async () => {
+    const { showtimeId, seatId, secondSeatId } = await seedShowtimeWithSeat();
+
+    const res = await request(app).post('/bookings').send({
+      showtimeId,
+      seatIds: [seatId, secondSeatId],
+    });
+
+    expect(res.status).toBe(201);
+    const responseSeats = res.body.seats as { id: string }[];
+    expect(responseSeats.map((seat) => seat.id)).toEqual([seatId, secondSeatId]);
+    expect(res.body.amountCents).toBe(3500);
+
+    const inventories = await db.seatInventory.findMany({
+      where: { showtimeId, seatId: { in: [seatId, secondSeatId] } },
+      orderBy: { seatId: 'asc' },
+    });
+    expect(inventories.every((inventory) => inventory.holdingBookingId === res.body.id)).toBe(true);
+  });
+
+  it('rolls back all seat holds when one selected seat is unavailable', async () => {
+    const { showtimeId, seatId, secondSeatId } = await seedShowtimeWithSeat();
+    const winner = await request(app).post('/bookings').send({ showtimeId, seatId: secondSeatId });
+    expect(winner.status).toBe(201);
+
+    const loser = await request(app).post('/bookings').send({
+      showtimeId,
+      seatIds: [seatId, secondSeatId],
+    });
+    expect(loser.status).toBe(409);
+
+    const untouched = await db.seatInventory.findUnique({
+      where: { showtimeId_seatId: { showtimeId, seatId } },
+    });
+    expect(untouched?.status).toBe('AVAILABLE');
+    expect(untouched?.holdingBookingId).toBeNull();
   });
 
   it('expired hold can be reclaimed by User B', async () => {

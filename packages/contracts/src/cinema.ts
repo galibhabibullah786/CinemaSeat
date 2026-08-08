@@ -54,6 +54,8 @@ export const SeatMapSchema = z.object({
 });
 export type SeatMap = z.infer<typeof SeatMapSchema>;
 
+export const MAX_SEATS_PER_BOOKING = 6;
+
 export const GetShowtimesQuerySchema = z
   .object({
     movieId: z.string().optional(),
@@ -64,10 +66,38 @@ export type GetShowtimesQuery = z.infer<typeof GetShowtimesQuerySchema>;
 export const CreateBookingBodySchema = z
   .object({
     showtimeId: z.string().min(1, 'showtimeId is required'),
-    seatId: z.string().min(1, 'seatId is required'),
+    seatId: z.string().min(1).optional(),
+    seatIds: z.array(z.string().min(1)).min(1).max(MAX_SEATS_PER_BOOKING).optional(),
     userRef: z.string().optional(),
   })
-  .strict();
+  .strict()
+  .superRefine((data, context) => {
+    if (!data.seatId && !data.seatIds?.length) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['seatIds'],
+        message: 'Either seatId or seatIds is required',
+      });
+    }
+    if (data.seatId && data.seatIds) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['seatIds'],
+        message: 'Use either seatId or seatIds, not both',
+      });
+    }
+    if (data.seatIds && new Set(data.seatIds).size !== data.seatIds.length) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['seatIds'],
+        message: 'seatIds must not contain duplicates',
+      });
+    }
+  })
+  .transform(({ seatId, seatIds, ...input }) => ({
+    ...input,
+    seatIds: seatIds ?? [seatId!],
+  }));
 export type CreateBookingBody = z.input<typeof CreateBookingBodySchema>;
 export type CreateBookingInput = z.output<typeof CreateBookingBodySchema>;
 

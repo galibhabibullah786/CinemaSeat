@@ -15,18 +15,6 @@ import { MobileBookingBar } from "../components/layout/MobileBookingBar";
 import { SeatLegend, SeatMap } from "../features/seats/SeatMap";
 import { removeConflictingSeats, toggleSeatSelection } from "../features/seats/selection";
 
-function conflictIdsFrom(error: unknown, seats: Seat[]): string[] {
-  if (error && typeof error === "object" && "details" in error) {
-    const details = (error as { details?: unknown }).details;
-    if (details && typeof details === "object") {
-      const record = details as Record<string, unknown>;
-      const value = record.conflictingSeatIds ?? record.conflicts ?? record.seatIds;
-      if (Array.isArray(value)) return value.filter((item): item is string => typeof item === "string");
-    }
-  }
-  return seats.filter((seat) => seat.status !== "AVAILABLE").map((seat) => seat.id);
-}
-
 export default function SeatSelectionPage() {
   const { showtimeId = "" } = useParams();
   const navigate = useNavigate();
@@ -51,13 +39,22 @@ export default function SeatSelectionPage() {
     },
     onError: async (error: unknown) => {
       if (isSeatConflict(error)) {
-        let ids = conflictIdsFrom(error, []);
-        const refreshed = await seatsQuery.refetch();
-        if (ids.length === 0) ids = conflictIdsFrom(error, refreshed.data?.seats ?? []);
-        setSelectedIds((current) => removeConflictingSeats(current, ids));
+        // The booking transaction is all-or-nothing. Without exact conflict
+        // ids in the error envelope, retaining any submitted selection risks
+        // showing a seat as selected after the server rejected the whole hold.
+        setSelectedIds([]);
+        await queryClient.cancelQueries({ queryKey: queryKeys.seats(showtimeId) });
+        try {
+          await queryClient.fetchQuery({
+            queryKey: queryKeys.seats(showtimeId),
+            queryFn: ({ signal }) => cinemaApi.getSeats(showtimeId, signal),
+            staleTime: 0,
+          });
+        } catch {
+          // The selection is already cleared; normal polling will retry the map.
+        }
         setConflictMessage("Someone else just held a seat you selected. We refreshed the seat map.");
-        toast.warning("Seat availability changed", { description: "We removed only the unavailable seats and kept the rest." });
-        void queryClient.invalidateQueries({ queryKey: queryKeys.seats(showtimeId) });
+        toast.warning("Seat availability changed", { description: "We cleared your selection and refreshed the live map." });
         return;
       }
       const apiError = error as { message?: string; status?: number; requestId?: string };
@@ -95,5 +92,5 @@ export default function SeatSelectionPage() {
     setSelectedIds(result.ids);
   };
 
-  return <div className="seat-page shell page-section"><div className="seat-page__top"><Link className="back-link" to={`/movies/${showtimeQuery.data.movieId}`}><ArrowLeft size={15} /> Back to showtimes</Link><LiveIndicator label={visible ? "Live map" : "Paused in background"} /></div><div className="seat-summary-line"><div><span className="eyebrow">{showtimeQuery.data.theatreName} · {showtimeQuery.data.screenName ?? "Screen"}</span><h1>{formatTime(showtimeQuery.data.startsAt)} <span>·</span> {formatDateTime(showtimeQuery.data.startsAt, { hour: undefined, minute: undefined })}</h1></div><StepIndicator current={1} /></div><div className="seat-layout"><div className="seat-main"><div className="screen-stage"><div className="screen-glow" aria-hidden="true" /><div className="screen-line" /><span>SCREEN</span></div><div className="seat-map-scroll"><SeatMap seats={seats} selectedIds={selectedIds} onToggle={toggleSeat} disabled={holdMutation.isPending} /></div><SeatLegend /><div className="seat-note"><TriangleAlert size={15} /><span>Held and booked seats are locked. Seat prices may vary by row.</span></div>{conflictMessage ? <p className="sr-only" role="alert">{conflictMessage}</p> : null}</div><aside className="seat-aside"><Card className="seat-summary-card"><div className="summary-heading"><div><span className="eyebrow">{showtimeQuery.data.theatreName}</span><h2>Review your seats</h2></div><Badge tone="success">{seats.filter((seat) => seat.status === "AVAILABLE").length} open</Badge></div><div className="compact-showtime"><span>{formatDateTime(showtimeQuery.data.startsAt)}</span><strong>{showtimeQuery.data.screenName ?? "Standard screen"}</strong></div><div className="selected-chips">{selectedSeats.length ? selectedSeats.map((seat) => <button className="selected-chip" type="button" key={seat.id} onClick={() => toggleSeat(seat)}>{seat.label}<span aria-hidden="true">×</span></button>) : <p className="muted">No seats selected yet.</p>}</div><div className="price-lines"><div><span>Tickets</span><strong>{formatMoney(total, currency)}</strong></div><div className="price-total"><span>Total</span><strong>{formatMoney(total, currency)}</strong></div></div><Button size="lg" className="summary-continue" disabled={!selectedIds.length} loading={holdMutation.isPending} onClick={() => holdMutation.mutate()}>Continue to verify <span aria-hidden="true">→</span></Button><p className="summary-helper"><Info size={14} /> Holds are server-confirmed and time-limited.</p></Card></aside></div><MobileBookingBar><div><span className="mobile-booking-bar__count">{selectedIds.length ? `${selectedIds.length} selected` : "Choose seats"}</span><strong>{formatMoney(total, currency)}</strong></div><Button disabled={!selectedIds.length} loading={holdMutation.isPending} onClick={() => holdMutation.mutate()}>Continue</Button></MobileBookingBar></div>;
+  return <div className="seat-page shell page-section"><div className="seat-page__top"><Link className="back-link" to={`/movies/${showtimeQuery.data.movieId}`}><ArrowLeft size={15} /> Back to showtimes</Link><LiveIndicator label={visible ? "Live map" : "Paused in background"} /></div><div className="seat-summary-line"><div><span className="eyebrow">{showtimeQuery.data.theatreName} · {showtimeQuery.data.screenName ?? "Screen"}</span><h1>{formatTime(showtimeQuery.data.startsAt)} <span>·</span> {formatDateTime(showtimeQuery.data.startsAt, { hour: undefined, minute: undefined })}</h1></div><StepIndicator current={1} /></div>{conflictMessage ? <div className="seat-conflict-banner" role="alert"><TriangleAlert size={16} /><span>{conflictMessage}</span><button type="button" className="seat-conflict-banner__dismiss" aria-label="Dismiss" onClick={() => setConflictMessage("")}>×</button></div> : null}<div className="seat-layout"><div className="seat-main"><div className="screen-stage"><div className="screen-glow" aria-hidden="true" /><div className="screen-line" /><span>SCREEN</span></div><div className="seat-map-scroll"><SeatMap seats={seats} selectedIds={selectedIds} onToggle={toggleSeat} disabled={holdMutation.isPending} /></div><SeatLegend /><div className="seat-note"><TriangleAlert size={15} /><span>Held and booked seats are locked. Seat prices may vary by row.</span></div></div><aside className="seat-aside"><Card className="seat-summary-card"><div className="summary-heading"><div><span className="eyebrow">{showtimeQuery.data.theatreName}</span><h2>Review your seats</h2></div><Badge tone="success">{seats.filter((seat) => seat.status === "AVAILABLE").length} open</Badge></div><div className="compact-showtime"><span>{formatDateTime(showtimeQuery.data.startsAt)}</span><strong>{showtimeQuery.data.screenName ?? "Standard screen"}</strong></div><div className="selected-chips">{selectedSeats.length ? selectedSeats.map((seat) => <button className="selected-chip" type="button" key={seat.id} onClick={() => toggleSeat(seat)}>{seat.label}<span aria-hidden="true">×</span></button>) : <p className="muted">No seats selected yet.</p>}</div><div className="price-lines"><div><span>Tickets</span><strong>{formatMoney(total, currency)}</strong></div><div className="price-total"><span>Total</span><strong>{formatMoney(total, currency)}</strong></div></div><Button size="lg" className="summary-continue" disabled={!selectedIds.length} loading={holdMutation.isPending} onClick={() => holdMutation.mutate()}>Continue to verify <span aria-hidden="true">→</span></Button><p className="summary-helper"><Info size={14} /> Holds are server-confirmed and time-limited.</p></Card></aside></div><MobileBookingBar><div><span className="mobile-booking-bar__count">{selectedIds.length ? `${selectedIds.length} selected` : "Choose seats"}</span><strong>{formatMoney(total, currency)}</strong></div><Button disabled={!selectedIds.length} loading={holdMutation.isPending} onClick={() => holdMutation.mutate()}>Continue</Button></MobileBookingBar></div>;
 }

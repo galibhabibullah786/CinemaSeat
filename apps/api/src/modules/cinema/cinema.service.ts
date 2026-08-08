@@ -97,7 +97,7 @@ export class CinemaService {
   }
 
   async createBooking(input: CreateBookingInput): Promise<Booking> {
-    const { showtimeId, seatId } = input;
+    const { showtimeId, seatIds } = input;
 
     const showtime = await this.deps.cinema.findShowtimeById(this.deps.db, showtimeId);
     if (!showtime) throw new NotFoundError('Showtime', showtimeId);
@@ -111,15 +111,19 @@ export class CinemaService {
       const ref = `CS-${year}-${randomRefNum}`;
       const bookingId = randomUUID();
 
-      const held = await this.deps.cinema.holdSeatAtomically(
-        tx,
-        showtimeId,
-        seatId,
-        expiresAt,
-        bookingId,
-      );
-      if (!held) {
-        throw new SeatUnavailableError(`Seat ${seatId} is unavailable for showtime ${showtimeId}`);
+      const heldSeats = [];
+      for (const seatId of seatIds) {
+        const held = await this.deps.cinema.holdSeatAtomically(
+          tx,
+          showtimeId,
+          seatId,
+          expiresAt,
+          bookingId,
+        );
+        if (!held) {
+          throw new SeatUnavailableError(`Seat ${seatId} is unavailable for showtime ${showtimeId}`);
+        }
+        heldSeats.push(held);
       }
 
       return this.deps.cinema.createBookingRecord(tx, {
@@ -127,11 +131,10 @@ export class CinemaService {
         ref,
         showtimeId,
         status: 'HELD',
-        amountCents: held.priceCents,
+        amountCents: heldSeats.reduce((total, seat) => total + seat.priceCents, 0),
         currency: showtime.currency ?? 'USD',
         expiresAt,
-        seatId: held.seatId,
-        seatPriceCents: held.priceCents,
+        seats: heldSeats.map((seat) => ({ seatId: seat.seatId, priceCents: seat.priceCents })),
       });
     });
 
@@ -149,7 +152,9 @@ export class CinemaService {
   }
 
   async releaseHold(ref: string): Promise<void> {
-    const released = await this.deps.cinema.releaseHoldAtomically(this.deps.db, ref);
+    const released = await this.deps.db.$transaction((tx) =>
+      this.deps.cinema.releaseHoldAtomically(tx, ref),
+    );
     if (!released) throw new NotFoundError('Booking', ref);
   }
 }
