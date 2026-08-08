@@ -127,7 +127,13 @@ services:
         # Relative path: the browser calls the same origin it loaded from, and
         # nginx proxies /api/ to the API. This is what allows the API to stay
         # unpublished while still being reachable from a browser.
-        VITE_API_URL: /api
+        #
+        # Interpolated from `.env` so a deployer who needs the API on a
+        # different host can change VITE_API_URL without editing this file --
+        # but the SAFE default is /api. If you change it to an absolute URL
+        # you MUST also publish the API port and add the matching origin to
+        # CORS_ORIGINS, or every browser request will fail CORS.
+        VITE_API_URL: ${VITE_API_URL:-/api}
     image: ${GHCR_REGISTRY:-ghcr.io}/${GHCR_NAMESPACE:-local}/baseplate-web:${IMAGE_TAG:-latest}
     restart: unless-stopped
     init: true
@@ -170,6 +176,35 @@ services:
       dockerfile: docker/Dockerfile.api
       target: migrate
     image: ${GHCR_REGISTRY:-ghcr.io}/${GHCR_NAMESPACE:-local}/baseplate-migrate:${IMAGE_TAG:-latest}
+    restart: 'no'
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}?schema=public
+    depends_on:
+      db:
+        condition: service_healthy
+    networks: [backend]
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    logging: *logging
+
+  # ---------------------------------------------------------------------------
+  # One-shot demo-data seed. Behind a profile, same as `migrate` -- it does NOT
+  # run on `up`.
+  #
+  # Reuses the `migrate` image rather than shipping a fourth one: that image
+  # already has the Prisma CLI's production dependency tree and the compiled
+  # seed script (docker/Dockerfile.api, `migrate` stage), so overriding the
+  # entrypoint is the entire cost of adding this service. `prisma/seed.ts`
+  # upserts on natural keys -- safe to run against a live, already-seeded
+  # database.
+  #
+  # Run it deliberately, after `migrate`:
+  #     docker compose ... --profile seed run --rm seed
+  # which is what `make seed` does.
+  seed:
+    profiles: [seed]
+    image: ${GHCR_REGISTRY:-ghcr.io}/${GHCR_NAMESPACE:-local}/baseplate-migrate:${IMAGE_TAG:-latest}
+    entrypoint: ['node', 'prisma/seed.js']
     restart: 'no'
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}?schema=public

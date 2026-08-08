@@ -12,7 +12,7 @@ SHELL := /bin/bash
 
 # Reject silent no-ops caused by a stray file named like a target.
 .PHONY: help setup dev dev-detached prod down logs test test-unit test-integration \
-        e2e lint typecheck build ci-local actionlint deploy migrate \
+        e2e lint typecheck build ci-local actionlint deploy migrate seed \
         verify-isolation reset-domain clean prune ps
 
 # --- configuration -----------------------------------------------------------
@@ -56,17 +56,21 @@ prod: ## Build and run the full production stack locally (web on $$WEB_PORT)
 	@echo "  waiting for the stack to become healthy..."
 	@bash scripts/wait-for-healthy.sh $(PROJECT)-prod
 	$(MAKE) migrate
+	$(MAKE) seed
 	@echo "  stack is up. web: http://localhost:$${WEB_PORT:-8080}"
 
 migrate: ## Apply Prisma migrations against the running prod stack
 	$(COMPOSE_PROD) --profile migrate run --rm migrate
+
+seed: ## Load demo data into the running prod stack (idempotent)
+	$(COMPOSE_PROD) --profile seed run --rm seed
 
 verify-isolation: ## Assert Postgres/API are unreachable from the host (criterion 4)
 	@bash scripts/verify-isolation.sh $(PROJECT)-prod
 
 down: ## Stop both stacks, KEEPING the database volume
 	-$(COMPOSE_DEV) down --remove-orphans
-	-$(COMPOSE_PROD) --profile migrate down --remove-orphans
+	-$(COMPOSE_PROD) --profile migrate --profile seed down --remove-orphans
 	@echo "  stopped. Postgres data survives in the named volume (use 'make prune' to destroy it)."
 
 logs: ## Tail logs from the prod stack (SERVICE=api to narrow)

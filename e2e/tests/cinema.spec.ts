@@ -1,7 +1,17 @@
 import { expect, test, type Page } from '@playwright/test';
 import type { Booking, SeatMap } from '@baseplate/contracts';
 
-const apiUrl = process.env.VITE_API_URL ?? 'http://localhost:4000';
+// Relative, not `process.env.VITE_API_URL` -- that variable is the FRONTEND
+// BUILD's config (baked into the bundle at image build time, see
+// docker/Dockerfile.web), not something set in the Playwright process's
+// environment, so it always fell back to the http://localhost:4000 dev
+// default. In this topology (compose.prod.yaml) the API publishes NO port
+// at all -- criterion 4 -- so a direct request to that host always fails
+// with ECONNREFUSED. `page.request` resolves a relative URL against
+// `use.baseURL` (playwright.config.ts), the same nginx origin the browser
+// itself uses, so this reaches the API through the SAME /api/ proxy path
+// real users go through.
+const apiUrl = '/api';
 const showtimeId = 'st-dune-1';
 
 async function getSeats(page: Page): Promise<SeatMap['seats']> {
@@ -100,12 +110,16 @@ test.describe('CinemaSeat real frontend/API integration', () => {
     const competitor = await competitorResponse.json() as Pick<Booking, 'ref'>;
 
     try {
+      // `response.url()` is always absolute (the browser resolves it against
+      // the page's origin before the request goes out), so comparing it
+      // against the relative `apiUrl` constant can never match -- use
+      // `.endsWith()`, the same pattern the hold-release check below uses.
       const [duplicateResponse, refreshResponse] = await Promise.all([
         page.waitForResponse((response) =>
-          response.request().method() === 'POST' && response.url() === `${apiUrl}/bookings`,
+          response.request().method() === 'POST' && response.url().endsWith(`${apiUrl}/bookings`),
         ),
         page.waitForResponse((response) =>
-          response.request().method() === 'GET' && response.url() === `${apiUrl}/showtimes/${showtimeId}/seats`,
+          response.request().method() === 'GET' && response.url().endsWith(`${apiUrl}/showtimes/${showtimeId}/seats`),
         ),
         page.getByRole('button', { name: /continue to verify/i }).click(),
       ]);

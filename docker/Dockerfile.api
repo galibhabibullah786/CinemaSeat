@@ -62,6 +62,18 @@ RUN pnpm --filter @baseplate/api exec prisma generate \
  && pnpm --filter @baseplate/logger   run build \
  && pnpm --filter @baseplate/api      exec tsc -p tsconfig.build.json
 
+# Compile prisma/seed.ts to plain JS, standalone from the main build.
+#
+# tsconfig.build.json's rootDir is `src`, on purpose: it produces the flat
+# `dist/main.js` the runtime ENTRYPOINT expects, and seed.ts living outside
+# `src/` is excluded from it. Compiling it here, with its own throwaway
+# tsconfig, keeps that boundary intact while still shipping the seed as JS --
+# the `migrate` image below has the Prisma CLI and its production
+# dependencies, but not `tsx` or any other dev-only TypeScript runner.
+RUN pnpm --filter @baseplate/api exec tsc prisma/seed.ts \
+      --outDir /seed-build --module nodenext --moduleResolution nodenext \
+      --target es2022 --esModuleInterop --skipLibCheck --resolveJsonModule
+
 # `pnpm deploy` materialises a self-contained directory: workspace deps are
 # copied in rather than symlinked out of the monorepo, so the runtime stage
 # needs nothing from /app. The generated Prisma client lives in
@@ -164,6 +176,13 @@ RUN cp -a /out /runtime \
 #
 # Both images are built from the SAME /out and tagged with the same commit SHA,
 # so the migration that runs and the code that serves can never disagree.
+#
+# This image also carries the compiled seed script (below). It is NOT run by
+# the default ENTRYPOINT -- compose.prod.yaml's `seed` service overrides the
+# entrypoint on this same image rather than shipping a fourth one. Seeding is
+# idempotent (upserts on natural keys) and, like migrations, is a deliberate,
+# separate step -- never something the API runs on boot, and never something
+# N replicas would race.
 FROM ${NODE_IMAGE} AS migrate
 ENV NODE_ENV=production
 WORKDIR /app
@@ -176,6 +195,9 @@ COPY --from=build --chown=node:node /out ./
 # with the generated client and has no business shipping the schema that
 # rewrites the database.
 COPY --from=build --chown=node:node /app/apps/api/prisma ./prisma
+# The compiled seed script, placed alongside schema.prisma/migrations/ so its
+# `../generated/prisma/index.js` import resolves exactly as it does in `src/`.
+COPY --from=build --chown=node:node /seed-build/seed.js ./prisma/seed.js
 USER node
 # Exec form: this is a one-shot job and must forward signals so a cancelled
 # deploy does not leave a half-applied migration holding locks.

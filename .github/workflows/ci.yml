@@ -221,6 +221,14 @@ jobs:
           cache: 'pnpm'
       - run: pnpm install --frozen-lockfile
       - run: pnpm --filter @baseplate/api exec prisma generate
+      # `pnpm --filter ... run` (below) invokes the package script directly and
+      # never enters turbo, so it never triggers @baseplate/api's declared
+      # `dependsOn: ["^build"]` -- unit tests importing @baseplate/contracts
+      # (e.g. cinema.service.unit.test.ts) then fail to resolve it, because
+      # its package.json points at dist/, which does not exist yet. Same fix
+      # as the `integration` job below; `^...` selects api's dependencies
+      # without building api itself.
+      - run: pnpm --filter "@baseplate/api^..." run build
       - run: pnpm --filter @baseplate/api run test:unit
 
   # --------------------------------------------------------------------------
@@ -370,6 +378,9 @@ jobs:
           IMAGE_TAG: e2e-${{ github.sha }}
           GHCR_NAMESPACE: local
         run: |
+          # `make prod` also runs migrate + seed, so the suite's fixtures
+          # ("Dune: Part Two" et al., from apps/api/prisma/seed.ts) exist
+          # before Playwright ever navigates to the app.
           make prod
           bash scripts/verify-isolation.sh baseplate-prod
 

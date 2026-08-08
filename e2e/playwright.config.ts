@@ -18,17 +18,8 @@ export default defineConfig({
   retries: process.env.CI ? 1 : 0,
   reporter: [['list'], ['html', { open: 'never' }]],
   outputDir: './test-results',
-  webServer: {
-    command: 'pnpm --filter @baseplate/web dev',
-    url: 'http://localhost:5173',
-    reuseExistingServer: !process.env.CI,
-    env: {
-      VITE_USE_MOCKS: 'false',
-      VITE_API_URL: 'http://localhost:4000',
-    },
-  },
   use: {
-    baseURL: process.env.E2E_BASE_URL ?? 'http://localhost:5173',
+    baseURL: process.env.E2E_BASE_URL ?? 'http://localhost:8080',
     trace: 'retain-on-failure',
     screenshot: 'only-on-failure',
     video: 'retain-on-failure',

@@ -25,6 +25,38 @@ function main(): void {
     base: { env: env.NODE_ENV, version: env.APP_VERSION },
   });
 
+  /**
+   * Fail-fast misconfiguration warning. The most common production-deploy bug
+   * is shipping CORS_ORIGINS=http://localhost:8080 (the dev-default from
+   * .env.example) to a remote VM. Every browser request from a real origin
+   * then gets blocked at the preflight, and the cause is invisible from the
+   * browser -- the operator sees a generic "network error" and assumes the
+   * API is down.
+   *
+   * The schema cannot reject this (an operator may legitimately need to
+   * bring the service up on localhost first), so warn instead. Triggered
+   * only in production, and only when the allowlist LOOKS LIKE the dev
+   * default -- empty or containing exactly localhost variants.
+   */
+  if (isProduction) {
+    const origins = env.CORS_ORIGINS;
+    const looksLikeDevDefault =
+      origins.length === 0 ||
+      origins.every((o) => o.startsWith('http://localhost') || o.startsWith('http://127.0.0.1'));
+    if (looksLikeDevDefault) {
+      logger.warn(
+        {
+          corsOrigins: origins,
+          hint:
+            'CORS_ORIGINS only contains localhost origins, but NODE_ENV=production. ' +
+            'Every browser request from a real domain will be blocked by CORS. ' +
+            'Set CORS_ORIGINS to the real origin (e.g. https://app.example.com) in .env.',
+        },
+        'CORS_ORIGINS looks like a dev default in production -- browser requests will be blocked',
+      );
+    }
+  }
+
   const db = createPrismaClient({
     databaseUrl: env.DATABASE_URL,
     logger,
