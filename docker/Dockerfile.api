@@ -194,9 +194,21 @@ ENTRYPOINT ["node", "node_modules/prisma/build/index.js", "migrate", "deploy"]
 # Copying the binary out of the official image keeps the exact, digest-pinned
 # Node build -- this is not a different or self-compiled Node. libstdc++ is the
 # one shared library the binary needs beyond musl.
-FROM alpine:3.21@sha256:56fa17d2a7e7f168a043a2712e63aed1f8543aeafdcee47c58dcffe38ed51099 AS runtime
+#
+# The digest is 3.21.7. Bump it when the image scan reports fixable OS CVEs:
+# a digest pin is frozen in time, so openssl/musl/zlib in the base go stale
+# while their patches ship in the 3.21 branch, and the scan (correctly) fails
+# on findings that already have a fixed version. Pinning buys reproducibility,
+# not immunity -- it has to be re-pointed, and the scan is what tells us when.
+FROM alpine:3.21@sha256:48b0309ca019d89d40f670aa1bc06e426dc0931948452e8491e3d65087abc07d AS runtime
 
-RUN apk add --no-cache libstdc++ \
+# `upgrade` before `add`: the digest above fixes the starting point, but the
+# base is only rebuilt when we bump it, whereas apk patches land continuously.
+# This costs nothing in determinism that `apk add` was not already spending --
+# it resolves against the live index at build time either way -- and it keeps
+# the image patched in the window between digest bumps.
+RUN apk upgrade --no-cache \
+ && apk add --no-cache libstdc++ \
  # The official image's `node` user (uid 1000) does not exist on bare Alpine.
  && addgroup -g 1000 node \
  && adduser -u 1000 -G node -s /bin/sh -D node
