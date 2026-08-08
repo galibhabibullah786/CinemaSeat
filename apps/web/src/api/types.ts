@@ -1,4 +1,5 @@
-export const MAX_SEATS_PER_BOOKING = 6;
+import type { CreateBookingInput as ContractCreateBookingInput } from "@baseplate/contracts";
+export { MAX_SEATS_PER_BOOKING } from "@baseplate/contracts";
 
 export type SeatStatus =
   | "AVAILABLE"
@@ -73,10 +74,7 @@ export interface Booking {
   message?: string;
 }
 
-export interface CreateBookingInput {
-  showtimeId: string;
-  seatIds: string[];
-}
+export type CreateBookingInput = ContractCreateBookingInput;
 
 export interface OtpSendResult {
   accepted: boolean;

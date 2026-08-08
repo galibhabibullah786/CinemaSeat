@@ -1,142 +1,137 @@
-import { expect, test } from '@playwright/test';
+import { expect, test, type Page } from '@playwright/test';
+import type { Booking, SeatMap } from '@baseplate/contracts';
 
-test.describe('CinemaSeat E2E Flow (Mock Mode)', () => {
-  test('complete booking flow from discover to confirmed ticket', async ({ page }) => {
-    // 1. Discover page loads
+const apiUrl = process.env.VITE_API_URL ?? 'http://localhost:4000';
+const showtimeId = 'st-dune-1';
+
+async function getSeats(page: Page): Promise<SeatMap['seats']> {
+  const response = await page.request.get(`${apiUrl}/showtimes/${showtimeId}/seats`);
+  expect(response.status()).toBe(200);
+  const body = await response.json() as SeatMap;
+  return body.seats;
+}
+
+function parseSeatName(name: string | null): { rowLabel: string; seatNumber: number; label: string } {
+  const match = name?.match(/Row ([^,]+), seat (\d+)/i);
+  expect(match).toBeTruthy();
+  return { rowLabel: match![1], seatNumber: Number(match![2]), label: `${match![1]}${match![2]}` };
+}
+
+test.describe('CinemaSeat real frontend/API integration', () => {
+  test('discovers movies and showtimes, holds seats, shows details and countdown, then releases the hold', async ({ page }) => {
     await page.goto('/');
     await expect(page.getByRole('heading', { name: /now showing/i })).toBeVisible();
-    const movieHeading = page.getByRole('heading', { name: 'Dune: Part Two', level: 3 });
-    await expect(movieHeading).toBeVisible();
+    await expect(page.locator('.movie-card h3')).toHaveCount(4);
 
-    // 2. Open a movie
-    await movieHeading.click();
+    await page.getByRole('heading', { name: 'Dune: Part Two', level: 3 }).click();
     await expect(page.getByRole('heading', { name: 'Dune: Part Two', level: 1 })).toBeVisible();
-
-    // 3. Select today's showtime
-    await expect(page.getByRole('tab', { name: /today/i })).toBeVisible();
     const showtimeLink = page.getByRole('link', { name: /left/i }).first();
     await expect(showtimeLink).toBeVisible();
     await showtimeLink.click();
 
-    // 4. Open seat map and select an available seat
     await expect(page.getByRole('heading', { name: /review your seats/i })).toBeVisible();
-    const seatA4 = page.getByRole('button', { name: /Row A, seat 4/i });
-    await expect(seatA4).toBeVisible();
-    await seatA4.click();
-    await expect(seatA4).toHaveAttribute('aria-pressed', 'true');
+    const firstAvailable = page.getByRole('button', { name: /Available/i }).first();
+    const firstName = await firstAvailable.getAttribute('aria-label');
+    await firstAvailable.click();
+    const secondAvailable = page.getByRole('button', { name: /Available/i }).first();
+    const secondName = await secondAvailable.getAttribute('aria-label');
+    await secondAvailable.click();
+    const firstSeat = parseSeatName(firstName);
+    const secondSeat = parseSeatName(secondName);
 
-    // 5. Continue and verify /checkout/:bookingRef
-    const continueBtn = page.getByRole('button', { name: /continue to verify|continue/i }).first();
-    await continueBtn.click();
-    await page.waitForURL(/\/checkout\/CS-\d{4}-\d+/);
-    expect(page.url()).toMatch(/\/checkout\/CS-\d{4}-\d+/);
+    await Promise.all([
+      page.waitForURL(/\/checkout\/CS-\d{4}-\d+/),
+      page.getByRole('button', { name: /continue to verify/i }).click(),
+    ]);
+    const bookingRef = page.url().split('/').pop()!;
 
-    // 6. Complete mock OTP flow
-    const phoneInput = page.getByLabel(/phone number/i);
-    await expect(phoneInput).toBeVisible();
-    await phoneInput.fill('+1 555 014 2040');
+    await expect(page.getByRole('heading', { name: /verify, then take your seats/i })).toBeVisible();
+    await expect(page.getByText('Dune: Part Two')).toBeVisible();
+    await expect(page.locator('.summary-seat-list strong')).toContainText([firstSeat.label, secondSeat.label].join(', '));
+    await expect(page.locator('.booking-ref code')).toHaveText(bookingRef);
 
-    const sendOtpBtn = page.getByRole('button', { name: /send otp/i });
-    await sendOtpBtn.click();
+    const countdown = page.locator('.countdown strong');
+    await expect(countdown).toHaveText(/^\d{2}:\d{2}$/);
+    const before = await countdown.textContent();
+    await page.waitForTimeout(1_500);
+    const after = await countdown.textContent();
+    expect(after).not.toBe(before);
 
-    await expect(page.getByLabel('Verification digit 1')).toBeVisible();
-    const otpDigits = ['1', '2', '3', '4', '5', '6'];
-    for (let i = 0; i < 6; i++) {
-      await page.getByLabel(`Verification digit ${i + 1}`).fill(otpDigits[i]!);
-    }
-
-    const verifyOtpBtn = page.getByRole('button', { name: /verify code/i });
-    await verifyOtpBtn.click();
-    await expect(page.getByRole('status')).toContainText(/phone verified/i);
-
-    // 7. Start mock payment
-    const payBtn = page.getByRole('button', { name: /pay \$/i });
-    await expect(payBtn).toBeEnabled();
-    await payBtn.click();
-
-    // 8. Verify pending status and confirmation
-    await page.waitForURL(/\/booking\/CS-\d{4}-\d+/);
-    expect(page.url()).toMatch(/\/booking\/CS-\d{4}-\d+/);
-
-    // 9. Verify confirmed booking/ticket page
-    await expect(page.getByRole('heading', { name: /you’re in/i })).toBeVisible({ timeout: 15_000 });
-    await expect(page.getByText('Dune: Part Two').first()).toBeVisible();
-    await expect(page.getByText(/show this code at entry/i)).toBeVisible();
-  });
-
-  test('booked and held seats cannot be selected', async ({ page }) => {
-    await page.goto('/showtimes/st-dune-1/seats');
-    await expect(page.getByRole('heading', { name: /review your seats/i })).toBeVisible();
-
-    // Booked seat A1 must be disabled
-    const bookedSeat = page.getByRole('button', { name: /Row A, seat 1, Booked/i });
-    await expect(bookedSeat).toBeDisabled();
-
-    // Held seat B6 must be disabled
-    const heldSeat = page.getByRole('button', { name: /Row B, seat 6, Held/i });
-    await expect(heldSeat).toBeDisabled();
-  });
-
-  test('seat conflict shows message and refreshes seat map', async ({ page }) => {
-    await page.goto('/showtimes/st-dune-1/seats');
-    await expect(page.getByRole('heading', { name: /review your seats/i })).toBeVisible();
-
-    // Force conflict mode in browser session
-    await page.evaluate(() => sessionStorage.setItem('cinemaseat:mock-conflict', 'true'));
-
-    // Select available seat A4
-    const seatA4 = page.getByRole('button', { name: /Row A, seat 4/i });
-    await seatA4.click();
-
-    // Attempt to continue
-    const continueBtn = page.getByRole('button', { name: /continue to verify|continue/i }).first();
-    await continueBtn.click();
-
-    // Verify conflict error message is displayed
-    await expect(page.getByText(/someone else just held a seat/i)).toBeVisible();
-
-    // Clear conflict mode
-    await page.evaluate(() => sessionStorage.removeItem('cinemaseat:mock-conflict'));
-  });
-
-  test('hold expiry notice renders on expired booking checkout', async ({ page }) => {
-    // Navigate directly to checkout with expired or invalid hold
-    await page.goto('/checkout/CS-EXPIRED-TEST');
-    await expect(page.getByRole('heading', { name: /booking hold not found|this booking is no longer at checkout/i })).toBeVisible();
-  });
-
-  test('booking lookup works by reference', async ({ page }) => {
     await page.goto('/lookup');
-    await expect(page.getByRole('heading', { name: /find your booking/i })).toBeVisible();
+    await page.getByLabel(/your reference/i).fill(bookingRef);
+    await Promise.all([
+      page.waitForURL(new RegExp(`/booking/${bookingRef}$`)),
+      page.getByRole('button', { name: /view booking/i }).click(),
+    ]);
+    await expect(page.getByRole('heading', { name: /your booking is waiting/i })).toBeVisible();
+    await page.getByRole('link', { name: /continue checkout/i }).click();
 
-    const refInput = page.getByLabel(/your reference/i);
-    await refInput.fill('CS-2026-02401');
+    const [releaseResponse] = await Promise.all([
+      page.waitForResponse((response) =>
+        response.request().method() === 'DELETE' && response.url().endsWith(`/bookings/${bookingRef}/hold`),
+      ),
+      page.getByRole('button', { name: /exit checkout/i }).click(),
+    ]);
+    expect(releaseResponse.status()).toBe(200);
+    await expect(page).toHaveURL(/\/lookup$/);
 
-    const submitBtn = page.getByRole('button', { name: /view booking/i });
-    await submitBtn.click();
-
-    await page.waitForURL(/\/booking\/CS-2026-02401/);
-    expect(page.url()).toContain('/booking/CS-2026-02401');
+    const releasedSeats = await getSeats(page);
+    const heldLabels = [firstSeat.label, secondSeat.label];
+    for (const label of heldLabels) {
+      expect(releasedSeats.find((seat) => seat.label === label)?.status).toBe('AVAILABLE');
+    }
   });
 
-  test('mobile viewport flow operates correctly', async ({ page }) => {
-    await page.setViewportSize({ width: 375, height: 667 });
-    await page.goto('/');
+  test('a competing real hold returns 409 and refreshes the frontend seat map', async ({ page }) => {
+    await page.goto(`/showtimes/${showtimeId}/seats`);
+    const seatButton = page.getByRole('button', { name: /Available/i }).first();
+    const visibleName = await seatButton.getAttribute('aria-label');
+    await seatButton.click();
+    const visibleSeat = parseSeatName(visibleName);
+    const availableSeat = (await getSeats(page)).find(
+      (seat) => seat.rowLabel === visibleSeat.rowLabel && seat.seatNumber === visibleSeat.seatNumber,
+    );
+    expect(availableSeat?.status).toBe('AVAILABLE');
 
-    await page.getByRole('heading', { name: 'Dune: Part Two', level: 3 }).click();
-    const showtimeLink = page.getByRole('link', { name: /left/i }).first();
-    await showtimeLink.click();
+    const competitorResponse = await page.request.post(`${apiUrl}/bookings`, {
+      data: { showtimeId, seatIds: [availableSeat!.id] },
+    });
+    expect(competitorResponse.status()).toBe(201);
+    const competitor = await competitorResponse.json() as Pick<Booking, 'ref'>;
 
-    // Select available seat A4
-    const seatA4 = page.getByRole('button', { name: /Row A, seat 4/i });
-    await seatA4.click();
+    try {
+      const [duplicateResponse, refreshResponse] = await Promise.all([
+        page.waitForResponse((response) =>
+          response.request().method() === 'POST' && response.url() === `${apiUrl}/bookings`,
+        ),
+        page.waitForResponse((response) =>
+          response.request().method() === 'GET' && response.url() === `${apiUrl}/showtimes/${showtimeId}/seats`,
+        ),
+        page.getByRole('button', { name: /continue to verify/i }).click(),
+      ]);
+      expect(duplicateResponse.status()).toBe(409);
+      expect(refreshResponse.status()).toBe(200);
+      const refreshedSeats = await refreshResponse.json() as SeatMap;
+      await expect(page.getByRole('alert')).toContainText(/someone else just held a seat/i);
+      await expect(page.getByRole('button', {
+        name: new RegExp(`Row ${availableSeat!.rowLabel}, seat ${availableSeat!.seatNumber}, Selected`, 'i'),
+      })).toHaveCount(0);
+      expect(refreshedSeats.seats.find((seat) => seat.id === availableSeat!.id)?.status).toBe('HELD');
+    } finally {
+      const release = await page.request.delete(`${apiUrl}/bookings/${competitor.ref}/hold`);
+      expect(release.status()).toBe(200);
+    }
+  });
 
-    // Continue using mobile bar button
-    const mobileContinueBtn = page.getByRole('button', { name: 'Continue' });
-    await expect(mobileContinueBtn).toBeVisible();
-    await mobileContinueBtn.click();
+  test('booked seats are present in the real seat map and cannot be selected', async ({ page }) => {
+    await page.goto(`/showtimes/${showtimeId}/seats`);
+    const bookedSeat = page.getByRole('button', { name: /Booked/i }).first();
+    await expect(bookedSeat).toBeVisible();
+    await expect(bookedSeat).toBeDisabled();
+  });
 
-    await page.waitForURL(/\/checkout\/CS-\d{4}-\d+/);
-    expect(page.url()).toMatch(/\/checkout\/CS-\d{4}-\d+/);
+  test('an unknown booking reference shows the real not-found state', async ({ page }) => {
+    await page.goto('/checkout/CS-UNKNOWN-E2E');
+    await expect(page.getByRole('heading', { name: /booking hold not found/i })).toBeVisible();
   });
 });

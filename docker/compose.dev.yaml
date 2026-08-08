@@ -91,6 +91,7 @@ services:
       # there is no nginx in this stack. This is the one place dev and prod
       # differ in wiring, which is why CORS_ORIGINS above is not optional.
       VITE_API_URL: http://localhost:${API_HOST_PORT:-4000}
+      VITE_USE_MOCKS: 'false'
       # Docker bind mounts on some hosts do not deliver inotify events;
       # polling is slower but is the difference between hot reload working
       # and silently not working.

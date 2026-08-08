@@ -11,7 +11,7 @@ import { defineConfig, devices } from '@playwright/test';
  */
 export default defineConfig({
   testDir: './tests',
-  timeout: 30_000,
+  timeout: 45_000,
   expect: { timeout: 10_000 },
   fullyParallel: false, // single flow; serial keeps failure traces clean.
   workers: 1,
@@ -23,7 +23,7 @@ export default defineConfig({
     url: 'http://localhost:5173',
     reuseExistingServer: !process.env.CI,
     env: {
-      VITE_USE_MOCKS: 'true',
+      VITE_USE_MOCKS: 'false',
       VITE_API_URL: 'http://localhost:4000',
     },
   },

@@ -85,8 +85,10 @@ export interface CreateBookingData {
   amountCents: number;
   currency: string;
   expiresAt: Date;
-  seatId: string;
-  seatPriceCents: number;
+  seats: {
+    seatId: string;
+    priceCents: number;
+  }[];
 }
 
 export interface CinemaRepository {

@@ -163,6 +163,9 @@ importers:
 
   e2e:
     devDependencies:
+      '@baseplate/contracts':
+        specifier: workspace:*
+        version: link:../packages/contracts
       '@playwright/test':
         specifier: ^1.49.1
         version: 1.62.1

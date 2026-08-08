@@ -39,8 +39,9 @@ describe("CinemaSeat frontend contracts", () => {
   });
 
   it("normalizes a backend seat list into the stable seat map", () => {
-    const result = mapSeatMap({ seats: [{ seat_id: "B4", row: "B", number: 4, state: "sold", price_cents: 1500 }] }, "show-1");
+    const result = mapSeatMap({ seats: [{ seat_id: "B4", row: "B", number: 4, state: "sold", price_cents: 1500 }, { seat_id: "B5", row: "B", number: 5, status: "HELD", price_cents: 1500 }] }, "show-1");
     expect(result.seats[0]).toMatchObject({ id: "B4", label: "B4", status: "BOOKED", priceCents: 1500 });
+    expect(result.seats[1]).toMatchObject({ id: "B5", label: "B5", status: "HELD", priceCents: 1500 });
   });
 
   it("toggles an available seat with an accessible button", () => {

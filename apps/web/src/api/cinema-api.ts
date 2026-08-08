@@ -58,7 +58,7 @@ export function mapBookingStatus(value: unknown): Booking["status"] {
 export function mapSeatStatus(value: unknown): Seat["status"] {
   const rawString = typeof value === "string" || typeof value === "number" ? String(value) : "AVAILABLE";
   const status = rawString.toUpperCase().replace(/[ -]/g, "_");
-  if (status === "HOLD" || status === "RESERVED") return "HELD";
+  if (status === "HELD" || status === "HOLD" || status === "RESERVED") return "HELD";
   if (status === "PAYMENT_PENDING" || status === "PAYMENTPENDING") return "PAYMENT_PENDING";
   if (status === "BOOKED" || status === "SOLD" || status === "UNAVAILABLE") return "BOOKED";
   if (status === "SELECTED") return "SELECTED";
@@ -192,15 +192,15 @@ export class RealCinemaApi implements CinemaApi {
 
   getShowtimes(movieId?: string, signal?: AbortSignal): Promise<Showtime[]> {
     const query = movieId ? `?movieId=${encodeURIComponent(movieId)}` : "";
-    return request(`showtimes${query}`, { signal }, parseList((value) => mapShowtime(value, movieId)));
+    return request(`showtimes${query}`, { signal, cache: "no-store" }, parseList((value) => mapShowtime(value, movieId)));
   }
 
   async getShowtime(showtimeId: string, signal?: AbortSignal): Promise<Showtime> {
-    return request(`showtimes/${encodeURIComponent(showtimeId)}`, { signal }, (body) => mapShowtime(unwrap(body)));
+    return request(`showtimes/${encodeURIComponent(showtimeId)}`, { signal, cache: "no-store" }, (body) => mapShowtime(unwrap(body)));
   }
 
   getSeats(showtimeId: string, signal?: AbortSignal): Promise<SeatMap> {
-    return request(`showtimes/${encodeURIComponent(showtimeId)}/seats`, { signal }, (body) => mapSeatMap(body, showtimeId));
+    return request(`showtimes/${encodeURIComponent(showtimeId)}/seats`, { signal, cache: "no-store" }, (body) => mapSeatMap(body, showtimeId));
   }
 
   createBooking(input: CreateBookingInput, signal?: AbortSignal): Promise<Booking> {
@@ -257,7 +257,7 @@ export class RealCinemaApi implements CinemaApi {
   }
 
   getBooking(bookingRef: string, signal?: AbortSignal): Promise<Booking> {
-    return request(`bookings/${encodeURIComponent(bookingRef)}`, { signal }, mapBooking);
+    return request(`bookings/${encodeURIComponent(bookingRef)}`, { signal, cache: "no-store" }, mapBooking);
   }
 }
 
