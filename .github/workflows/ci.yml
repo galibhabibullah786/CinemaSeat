@@ -55,7 +55,7 @@ jobs:
       - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
         with:
           fetch-depth: 1
-      - uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1b284cd68cea36 # v3.0.2
+      - uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36 # v3.0.2
         id: filter
         with:
           # `token` not needed because we only need diff context, not API write.
@@ -98,11 +98,11 @@ jobs:
     steps:
       - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
 
-      - uses: pnpm/action-setup@fe02b34f77f8bc703788d5817be081e59a2cc9d8 # v4.0.0
+      - uses: pnpm/action-setup@fe02b34f77f8bc703788d5817da081398fad5dd2 # v4.0.0
         with:
           version: 9.15.3
 
-      - uses: actions/setup-node@8f152de45cc393bb48ce5d89d36b731f54556e23 # v4.0.0
+      - uses: actions/setup-node@8f152de45cc393bb48ce5d89d36b731f54556e65 # v4.0.0
         with:
           node-version-file: '.nvmrc'
           cache: 'pnpm'
@@ -135,11 +135,11 @@ jobs:
     permissions: { contents: read }
     steps:
       - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
-      - uses: actions/setup-node@8f152de45cc393bb48ce5d89d36b731f54556e23 # v4.0.0
+      - uses: actions/setup-node@8f152de45cc393bb48ce5d89d36b731f54556e65 # v4.0.0
         with:
           node-version-file: '.nvmrc'
           cache: 'pnpm'
-      - uses: pnpm/action-setup@fe02b34f77f8bc703788d5817be081e59a2cc9d8 # v4.0.0
+      - uses: pnpm/action-setup@fe02b34f77f8bc703788d5817da081398fad5dd2 # v4.0.0
         with: { version: 9.15.3 }
       - run: pnpm install --frozen-lockfile
       - run: pnpm run lint
@@ -152,11 +152,11 @@ jobs:
     permissions: { contents: read }
     steps:
       - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
-      - uses: actions/setup-node@8f152de45cc393bb48ce5d89d36b731f54556e23 # v4.0.0
+      - uses: actions/setup-node@8f152de45cc393bb48ce5d89d36b731f54556e65 # v4.0.0
         with:
           node-version-file: '.nvmrc'
           cache: 'pnpm'
-      - uses: pnpm/action-setup@fe02b34f77f8bc703788d5817be081e59a2cc9d8 # v4.0.0
+      - uses: pnpm/action-setup@fe02b34f77f8bc703788d5817da081398fad5dd2 # v4.0.0
         with: { version: 9.15.3 }
       - run: pnpm install --frozen-lockfile
       - run: pnpm --filter @baseplate/api exec prisma generate
@@ -170,11 +170,11 @@ jobs:
     permissions: { contents: read }
     steps:
       - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
-      - uses: actions/setup-node@8f152de45cc393bb48ce5d89d36b731f54556e23 # v4.0.0
+      - uses: actions/setup-node@8f152de45cc393bb48ce5d89d36b731f54556e65 # v4.0.0
         with:
           node-version-file: '.nvmrc'
           cache: 'pnpm'
-      - uses: pnpm/action-setup@fe02b34f77f8bc703788d5817be081e59a2cc9d8 # v4.0.0
+      - uses: pnpm/action-setup@fe02b34f77f8bc703788d5817da081398fad5dd2 # v4.0.0
         with: { version: 9.15.3 }
       - run: pnpm install --frozen-lockfile
       - run: pnpm --filter @baseplate/api exec prisma generate
@@ -209,11 +209,11 @@ jobs:
       DATABASE_URL: postgresql://test:test@localhost:5432/baseplate_test?schema=public
     steps:
       - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
-      - uses: actions/setup-node@8f152de45cc393bb48ce5d89d36b731f54556e23 # v4.0.0
+      - uses: actions/setup-node@8f152de45cc393bb48ce5d89d36b731f54556e65 # v4.0.0
         with:
           node-version-file: '.nvmrc'
           cache: 'pnpm'
-      - uses: pnpm/action-setup@fe02b34f77f8bc703788d5817be081e59a2cc9d8 # v4.0.0
+      - uses: pnpm/action-setup@fe02b34f77f8bc703788d5817da081398fad5dd2 # v4.0.0
         with: { version: 9.15.3 }
       - run: pnpm install --frozen-lockfile
       - run: pnpm --filter @baseplate/api exec prisma migrate deploy
@@ -235,12 +235,12 @@ jobs:
         run: pnpm audit --audit-level=high
 
       - name: gitleaks
-        uses: gitleaks/gitleaks-action@9f97ad7b9c8f31c1c8e30d9d5c4d9a8f5a6b7c8d # v2.3.0
+        uses: gitleaks/gitleaks-action@1938557f6a58837331b99822ab17b8e536e7bef9 # v2.3.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Trivy filesystem scan
-        uses: aquasecurity/trivy-action@18f98f4b7833a83a5a8c5e4b9a6b3b3b6b3e3a3b # 0.24.0
+        uses: aquasecurity/trivy-action@6e7b7d1fd3e4fef0c5fa8cce1229c54b2c9bd0d8 # 0.24.0
         with:
           scan-type: fs
           scan-ref: .
@@ -274,9 +274,9 @@ jobs:
     steps:
       - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
 
-      - uses: pnpm/action-setup@fe02b34f77f8bc703788d5817be081e59a2cc9d8 # v4.0.0
+      - uses: pnpm/action-setup@fe02b34f77f8bc703788d5817da081398fad5dd2 # v4.0.0
         with: { version: 9.15.3 }
-      - uses: actions/setup-node@8f152de45cc393bb48ce5d89d36b731f54556e23 # v4.0.0
+      - uses: actions/setup-node@8f152de45cc393bb48ce5d89d36b731f54556e65 # v4.0.0
         with:
           node-version-file: '.nvmrc'
           cache: 'pnpm'
@@ -299,7 +299,7 @@ jobs:
 
       - name: Upload Playwright report
         if: always()
-        uses: actions/upload-artifact@4cec6d3a034512ded95b95e1e9d687c41cba9b85 # v4.4.0
+        uses: actions/upload-artifact@50769540e7f4bd5e21e526ee35c689e35e0d6874 # v4.4.0
         with:
           name: playwright-report
           path: e2e/playwright-report
@@ -327,12 +327,12 @@ jobs:
     steps:
       - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
 
-      - uses: docker/setup-qemu-action@c7c534cd26dd7334c3c56c3d11b2dcb5e76e2d29 # v3.2.0
+      - uses: docker/setup-qemu-action@49b3bc8e6bdd4a60e6116a5414239cba5943d3cf # v3.2.0
 
       - uses: docker/setup-buildx-action@988b5a0280414f521da01fcc63a27aeeb4b104db # v3.6.1
 
       - name: Login to GHCR
-        uses: docker/login-action@74a5fe4c2b332bf632e274f10f9aa86a01e3ca7c # v3.3.0
+        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -341,7 +341,7 @@ jobs:
       # Build the API image (not pushed here; the CD job pushes).
       - name: Build API
         id: build-api
-        uses: docker/build-push-action@ca635a4f4f194db07f3b72cfe1c3c5e9b54dd5e2 # v6.1.0
+        uses: docker/build-push-action@31159d49c0d4756269a0940a750801a1ea5d7003 # v6.1.0
         with:
           context: .
           file: docker/Dockerfile.api
@@ -354,7 +354,7 @@ jobs:
           load: true   # so we can scan the just-built image
 
       - name: Scan API image
-        uses: aquasecurity/trivy-action@18f98f4b7833a83a5a8c5e4b9a6b3b3b6b3e3a3b # 0.24.0
+        uses: aquasecurity/trivy-action@6e7b7d1fd3e4fef0c5fa8cce1229c54b2c9bd0d8 # 0.24.0
         with:
           image-ref: ${{ env.REGISTRY }}/${{ env.NAMESPACE }}/baseplate-api:sha-${{ github.sha }}
           severity: HIGH,CRITICAL
@@ -366,7 +366,7 @@ jobs:
           exit-code: '1'
 
       - name: Build + Scan Web
-        uses: docker/build-push-action@ca635a4f4f194db07f3b72cfe1c3c5e9b54dd5e2 # v6.1.0
+        uses: docker/build-push-action@31159d49c0d4756269a0940a750801a1ea5d7003 # v6.1.0
         with:
           context: .
           file: docker/Dockerfile.web

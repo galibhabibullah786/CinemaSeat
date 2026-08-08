@@ -51,7 +51,7 @@ jobs:
       - uses: docker/setup-buildx-action@988b5a0280414f521da01fcc63a27aeeb4b104db # v3.6.1
 
       - name: Login to GHCR
-        uses: docker/login-action@74a5fe4c2b332bf632e274f10f9aa86a01e3ca7c # v3.3.0
+        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -62,7 +62,7 @@ jobs:
         run: echo "sha=sha-$(echo ${{ github.sha }} | cut -c1-7)" >> "$GITHUB_OUTPUT"
 
       - name: Build + push API
-        uses: docker/build-push-action@ca635a4f4f194db07f3b72cfe1c3c5e9b54dd5e2 # v6.1.0
+        uses: docker/build-push-action@31159d49c0d4756269a0940a750801a1ea5d7003 # v6.1.0
         with:
           context: .
           file: docker/Dockerfile.api
@@ -77,7 +77,7 @@ jobs:
           push: true
 
       - name: Build + push web
-        uses: docker/build-push-action@ca635a4f4f194db07f3b72cfe1c3c5e9b54dd5e2 # v6.1.0
+        uses: docker/build-push-action@31159d49c0d4756269a0940a750801a1ea5d7003 # v6.1.0
         with:
           context: .
           file: docker/Dockerfile.web

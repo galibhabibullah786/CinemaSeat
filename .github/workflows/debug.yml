@@ -45,7 +45,7 @@ jobs:
           fi
 
       - name: Start tmate session
-        uses: mxschmitt/action-tmate@1d2ac8d47e5dca6ee265f88baff47d18421f1ab9 # v3.15
+        uses: mxschmitt/action-tmate@73f5c99ee9e93dd1055edce60b76402a2139164b # v3.15
         with:
           # `debug-input` so the user has to type a reason in the UI. Without
           # it the button is one click from an open shell, which the spec
