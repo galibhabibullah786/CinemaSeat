@@ -1,0 +1,89 @@
+# syntax=docker/dockerfile:1.10
+#
+# Web image. Built from the REPOSITORY ROOT as context:
+#   docker build -f docker/Dockerfile.web --build-arg VITE_API_URL=/api .
+#
+# Two stages: a Node stage that compiles the SPA, and an nginx stage that
+# serves it. The Node toolchain never reaches the final image -- the thing that
+# ships is static files plus a web server.
+
+ARG NODE_IMAGE=node:24-alpine@sha256:d32cdf619f63fe0471182d08996dd516c6275bb5fd31ae06e55a570bd9e1ad43
+# nginx-unprivileged, not stock nginx: it runs as uid 101 and listens on 8080
+# out of the box. Stock nginx starts its master process as root to bind :80,
+# which we would then have to undo.
+ARG NGINX_IMAGE=nginxinc/nginx-unprivileged:1.27-alpine@sha256:65e3e85dbaed8ba248841d9d58a899b6197106c23cb0ff1a132b7bfe0547e4c0
+
+# =============================================================================
+# deps -- manifests only, so source edits do not bust the dependency cache
+# =============================================================================
+FROM ${NODE_IMAGE} AS deps
+ENV PNPM_HOME=/pnpm \
+    PATH=/pnpm:$PATH \
+    COREPACK_ENABLE_DOWNLOAD_PROMPT=0
+RUN corepack enable
+WORKDIR /app
+
+COPY pnpm-lock.yaml pnpm-workspace.yaml package.json .npmrc ./
+COPY apps/web/package.json           apps/web/
+COPY packages/config/package.json    packages/config/
+COPY packages/contracts/package.json packages/contracts/
+
+RUN --mount=type=cache,id=pnpm-store,target=/pnpm/store \
+    pnpm install --frozen-lockfile --filter @baseplate/web... --filter .
+
+# =============================================================================
+# build -- compile the SPA
+# =============================================================================
+FROM deps AS build
+
+COPY packages/config    packages/config
+COPY packages/contracts packages/contracts
+COPY apps/web           apps/web
+
+# The API base URL is baked into the bundle at BUILD time -- it cannot be
+# changed by an environment variable on the running container. That is a
+# property of any SPA, and it is why this is a build arg.
+#
+# Default '/api': in compose.prod the browser talks to nginx on one origin and
+# nginx proxies /api/ to the API over the internal network. Same-origin means
+# no CORS preflight in production, and it is what lets the API stay unpublished.
+#
+# Vite REFUSES to build if this is empty (see apps/web/vite.config.ts), so a
+# missing value fails here rather than shipping an app that 404s every call.
+ARG VITE_API_URL=/api
+ENV VITE_API_URL=${VITE_API_URL}
+
+RUN pnpm --filter @baseplate/contracts run build \
+ && pnpm --filter @baseplate/web run build
+
+# =============================================================================
+# runtime -- nginx serving static files
+# =============================================================================
+FROM ${NGINX_IMAGE} AS runtime
+
+# Replace the default server block. `default.conf` is what the stock image's
+# nginx.conf includes, so overwriting it is the supported extension point.
+COPY docker/nginx.conf /etc/nginx/conf.d/default.conf
+
+# Security headers snippet. Goes in snippets/, NOT conf.d/ -- everything in
+# conf.d/*.conf is auto-included at http level by the stock nginx.conf, which
+# would apply these in the wrong context.
+COPY docker/nginx-security-headers.conf /etc/nginx/snippets/security-headers.conf
+
+# Only the compiled output. No node_modules, no source, no toolchain.
+COPY --from=build /app/apps/web/dist /usr/share/nginx/html
+
+# Already uid 101 in this image; stated explicitly so a base-image change
+# cannot silently promote the container to root.
+USER 101
+
+EXPOSE 8080
+
+# Hits /healthz, which nginx.conf answers directly with a literal 200. Probing
+# `/` instead would be satisfied by the SPA fallback and report "healthy" even
+# if the build output were missing entirely.
+HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
+  CMD wget -qO- http://127.0.0.1:8080/healthz >/dev/null 2>&1 || exit 1
+
+# Exec form so nginx is PID 1 and receives SIGTERM/SIGQUIT directly.
+ENTRYPOINT ["nginx", "-g", "daemon off;"]

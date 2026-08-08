@@ -1,0 +1,56 @@
+# Everything here is excluded from the build context sent to the daemon.
+# Two reasons, both load-bearing:
+#   1. Secrets (.env) must never enter an image layer -- layers are extractable.
+#   2. A smaller context means faster builds and fewer spurious cache busts.
+
+.git
+.github
+node_modules
+**/node_modules
+
+# build output -- the image builds its own, never copies a host build
+dist
+**/dist
+build
+**/build
+*.tsbuildinfo
+**/*.tsbuildinfo
+
+# Prisma's generated client. MUST be excluded: it contains a platform-specific
+# query engine binary. A developer on Debian generates a ~17MB
+# debian-openssl-3.0.x engine; copying that into an Alpine image ships a
+# binary that can never load, next to the musl one the build generates. Worse,
+# it makes the image contents depend on the host that built it.
+**/generated
+
+# caches
+.turbo
+**/.turbo
+.pnpm-store
+**/.vite
+
+# secrets
+.env
+.env.*
+!.env.example
+
+# tests / e2e artifacts
+coverage
+**/coverage
+playwright-report
+**/playwright-report
+test-results
+**/test-results
+blob-report
+**/blob-report
+
+# docs and scratch -- not needed to build a binary
+docs
+temp
+*.md
+!README.md
+
+# editor / OS
+.DS_Store
+.idea
+.vscode

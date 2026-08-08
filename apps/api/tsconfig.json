@@ -1,0 +1,11 @@
+{
+  "extends": "@baseplate/config/tsconfig.node.json",
+  "compilerOptions": {
+    "rootDir": "./",
+    "outDir": "./dist",
+    "tsBuildInfoFile": "./dist/.tsbuildinfo",
+    "types": ["node"]
+  },
+  "include": ["src/**/*", "tests/**/*", "vitest.config.ts", "vitest.integration.config.ts"],
+  "exclude": ["node_modules", "dist", "generated/**"]
+}

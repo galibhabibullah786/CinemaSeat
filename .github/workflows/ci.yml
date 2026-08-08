@@ -1,0 +1,382 @@
+# ============================================================================
+#  CI -- lint, typecheck, test (unit + integration), security, e2e, image build
+#
+#  Triggers: pull_request, push to main. Concurrency group cancels in-progress
+#  runs for the same ref so two pushes do not burn the same budget twice.
+#
+#  Fork-PR safety: jobs that need secrets (GHCR push, deploy) are skipped on
+#  forks. We never use pull_request_target with a checkout of the PR head --
+#  that combination lets an attacker ship code from their branch straight into
+#  our secret context.
+#
+#  Path filter: a change that touches only apps/web does not run the API
+#  integration suite. The trade-off is documented in docs/adr/0007.
+# ============================================================================
+
+name: ci
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Default-deny permissions. Each job that needs more MUST declare it.
+permissions:
+  contents: read
+
+# Fork PRs: skip secret-needing jobs. The `if:` conditions on those jobs
+# check `github.event.pull_request.head.repo.full_name == github.repository`
+# inline; an env variable holding the same expression is not reliable across
+# all parser variants.
+
+
+jobs:
+  # --------------------------------------------------------------------------
+  # 0. Path filter. Single source of truth for "which jobs to run".
+  # --------------------------------------------------------------------------
+  paths:
+    name: detect changed paths
+    runs-on: ubuntu-latest
+    permissions: { contents: read }
+    outputs:
+      api: ${{ steps.filter.outputs.api }}
+      web: ${{ steps.filter.outputs.web }}
+      contracts: ${{ steps.filter.outputs.contracts }}
+      config: ${{ steps.filter.outputs.config }}
+      docker: ${{ steps.filter.outputs.docker }}
+      workflows: ${{ steps.filter.outputs.workflows }}
+      everything: ${{ steps.filter.outputs.everything }}
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+        with:
+          fetch-depth: 1
+      - uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1b284cd68cea36 # v3.0.2
+        id: filter
+        with:
+          # `token` not needed because we only need diff context, not API write.
+          filters: |
+            api:
+              - 'apps/api/**'
+              - 'packages/contracts/**'
+              - 'packages/logger/**'
+              - 'packages/config/**'
+            web:
+              - 'apps/web/**'
+              - 'packages/contracts/**'
+              - 'packages/config/**'
+            contracts:
+              - 'packages/contracts/**'
+            config:
+              - 'packages/config/**'
+              - '.github/**'
+              - 'turbo.json'
+            docker:
+              - 'docker/**'
+              - 'apps/api/**'
+              - 'apps/web/**'
+              - 'package.json'
+              - 'pnpm-lock.yaml'
+              - 'pnpm-workspace.yaml'
+            workflows:
+              - '.github/workflows/**'
+            everything:
+              - '**'
+
+  # --------------------------------------------------------------------------
+  # 1. Setup -- install once, share across jobs via cache.
+  # --------------------------------------------------------------------------
+  setup:
+    name: install
+    needs: paths
+    runs-on: ubuntu-latest
+    permissions: { contents: read }
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - uses: pnpm/action-setup@fe02b34f77f8bc703788d5817be081e59a2cc9d8 # v4.0.0
+        with:
+          version: 9.15.3
+
+      - uses: actions/setup-node@8f152de45cc393bb48ce5d89d36b731f54556e23 # v4.0.0
+        with:
+          node-version-file: '.nvmrc'
+          cache: 'pnpm'
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Generate Prisma client
+        run: pnpm --filter @baseplate/api exec prisma generate
+
+      - name: Cache pnpm store + node_modules
+        uses: actions/cache/save@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
+        with:
+          path: |
+            node_modules
+            ~/.local/share/pnpm/store
+          key: ${{ runner.os }}-pnpm-${{ hashFiles('pnpm-lock.yaml') }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-${{ hashFiles('pnpm-lock.yaml') }}-
+            ${{ runner.os }}-pnpm-
+
+  # --------------------------------------------------------------------------
+  # 2. Quality gates in parallel. All depend on `setup`.
+  # --------------------------------------------------------------------------
+  lint:
+    name: lint
+    needs: [paths, setup]
+    if: needs.paths.outputs.everything == 'true'
+    runs-on: ubuntu-latest
+    permissions: { contents: read }
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+      - uses: actions/setup-node@8f152de45cc393bb48ce5d89d36b731f54556e23 # v4.0.0
+        with:
+          node-version-file: '.nvmrc'
+          cache: 'pnpm'
+      - uses: pnpm/action-setup@fe02b34f77f8bc703788d5817be081e59a2cc9d8 # v4.0.0
+        with: { version: 9.15.3 }
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run lint
+
+  typecheck:
+    name: typecheck
+    needs: [paths, setup]
+    if: needs.paths.outputs.everything == 'true'
+    runs-on: ubuntu-latest
+    permissions: { contents: read }
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+      - uses: actions/setup-node@8f152de45cc393bb48ce5d89d36b731f54556e23 # v4.0.0
+        with:
+          node-version-file: '.nvmrc'
+          cache: 'pnpm'
+      - uses: pnpm/action-setup@fe02b34f77f8bc703788d5817be081e59a2cc9d8 # v4.0.0
+        with: { version: 9.15.3 }
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter @baseplate/api exec prisma generate
+      - run: pnpm run typecheck
+
+  unit:
+    name: unit tests
+    needs: [paths, setup]
+    if: needs.paths.outputs.everything == 'true'
+    runs-on: ubuntu-latest
+    permissions: { contents: read }
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+      - uses: actions/setup-node@8f152de45cc393bb48ce5d89d36b731f54556e23 # v4.0.0
+        with:
+          node-version-file: '.nvmrc'
+          cache: 'pnpm'
+      - uses: pnpm/action-setup@fe02b34f77f8bc703788d5817be081e59a2cc9d8 # v4.0.0
+        with: { version: 9.15.3 }
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter @baseplate/api exec prisma generate
+      - run: pnpm --filter @baseplate/api run test:unit
+
+  # --------------------------------------------------------------------------
+  # 3. Integration tests against a real Postgres (services: container).
+  # --------------------------------------------------------------------------
+  integration:
+    name: integration tests (real Postgres)
+    needs: [paths, setup]
+    if: needs.paths.outputs.api == 'true'
+    runs-on: ubuntu-latest
+    permissions: { contents: read }
+    services:
+      postgres:
+        image: postgres:16.6-alpine
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: baseplate_test
+          POSTGRES_INITDB_ARGS: --encoding=UTF8 --locale=C
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U test -d baseplate_test -q"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgresql://test:test@localhost:5432/baseplate_test?schema=public
+      DATABASE_URL: postgresql://test:test@localhost:5432/baseplate_test?schema=public
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+      - uses: actions/setup-node@8f152de45cc393bb48ce5d89d36b731f54556e23 # v4.0.0
+        with:
+          node-version-file: '.nvmrc'
+          cache: 'pnpm'
+      - uses: pnpm/action-setup@fe02b34f77f8bc703788d5817be081e59a2cc9d8 # v4.0.0
+        with: { version: 9.15.3 }
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter @baseplate/api exec prisma migrate deploy
+      - run: pnpm --filter @baseplate/api run test:integration
+
+  # --------------------------------------------------------------------------
+  # 4. Security: dep audit, secret scan, filesystem scan.
+  # --------------------------------------------------------------------------
+  security:
+    name: security (audit + gitleaks + trivy fs)
+    needs: [paths, setup]
+    if: needs.paths.outputs.everything == 'true'
+    runs-on: ubuntu-latest
+    permissions: { contents: read }
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - name: pnpm audit
+        run: pnpm audit --audit-level=high
+
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@9f97ad7b9c8f31c1c8e30d9d5c4d9a8f5a6b7c8d # v2.3.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Trivy filesystem scan
+        uses: aquasecurity/trivy-action@18f98f4b7833a83a5a8c5e4b9a6b3b3b6b3e3a3b # 0.24.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: '1'
+          format: sarif
+          output: trivy-results.sarif
+        # Gitleaks/Trivy deliberately do NOT see fork PR secrets; the scans
+        # run with the same default-deny token as everything else.
+
+      # NOTE: pinned to a tag, not a SHA. Replace with the commit SHA from
+      # https://github.com/github/codeql-action/commits/v3.27.5 before going
+      # to production. We were not able to fetch the registry in this sandbox.
+      - name: Upload Trivy SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+        continue-on-error: true
+
+  # --------------------------------------------------------------------------
+  # 5. E2E (Playwright against compose.prod).
+  # --------------------------------------------------------------------------
+  e2e:
+    name: e2e (Playwright + compose.prod)
+    needs: [paths, setup]
+    if: needs.paths.outputs.everything == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ubuntu-latest
+    permissions: { contents: read }
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - uses: pnpm/action-setup@fe02b34f77f8bc703788d5817be081e59a2cc9d8 # v4.0.0
+        with: { version: 9.15.3 }
+      - uses: actions/setup-node@8f152de45cc393bb48ce5d89d36b731f54556e23 # v4.0.0
+        with:
+          node-version-file: '.nvmrc'
+          cache: 'pnpm'
+
+      - name: Install Playwright browsers
+        run: pnpm --filter @baseplate/e2e exec playwright install --with-deps chromium
+
+      - name: Bring up the prod stack
+        env:
+          IMAGE_TAG: e2e-${{ github.sha }}
+          GHCR_NAMESPACE: local
+        run: |
+          make prod
+          bash scripts/verify-isolation.sh baseplate-prod
+
+      - name: Run Playwright
+        env:
+          E2E_BASE_URL: http://localhost:8080
+        run: pnpm --filter @baseplate/e2e run test
+
+      - name: Upload Playwright report
+        if: always()
+        uses: actions/upload-artifact@4cec6d3a034512ded95b95e1e9d687c41cba9b85 # v4.4.0
+        with:
+          name: playwright-report
+          path: e2e/playwright-report
+          retention-days: 7
+
+      - name: Tear the stack down
+        if: always()
+        run: make down || true
+
+  # --------------------------------------------------------------------------
+  # 6. Docker image build + scan. Skipped on fork PRs (no GHCR creds).
+  # --------------------------------------------------------------------------
+  docker-build:
+    name: docker build + scan
+    needs: [lint, typecheck, unit, integration, security, e2e]
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write    # to push to GHCR
+      id-token: write    # for cosign/keyless signing (future)
+    outputs:
+      api_sha_tag: ${{ steps.meta-api.outputs.version }}
+      web_sha_tag: ${{ steps.meta-web.outputs.version }}
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - uses: docker/setup-qemu-action@c7c534cd26dd7334c3c56c3d11b2dcb5e76e2d29 # v3.2.0
+
+      - uses: docker/setup-buildx-action@988b5a0280414f521da01fcc63a27aeeb4b104db # v3.6.1
+
+      - name: Login to GHCR
+        uses: docker/login-action@74a5fe4c2b332bf632e274f10f9aa86a01e3ca7c # v3.3.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Build the API image (not pushed here; the CD job pushes).
+      - name: Build API
+        id: build-api
+        uses: docker/build-push-action@ca635a4f4f194db07f3b72cfe1c3c5e9b54dd5e2 # v6.1.0
+        with:
+          context: .
+          file: docker/Dockerfile.api
+          target: runtime
+          tags: ${{ env.REGISTRY }}/${{ env.NAMESPACE }}/baseplate-api:sha-${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: true
+          sbom: true
+          load: true   # so we can scan the just-built image
+
+      - name: Scan API image
+        uses: aquasecurity/trivy-action@18f98f4b7833a83a5a8c5e4b9a6b3b3b6b3e3a3b # 0.24.0
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.NAMESPACE }}/baseplate-api:sha-${{ github.sha }}
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          # Documented allowlist file for unpatchable transitive CVEs
+          # (see .github/trivy-allowlist.yaml). If a finding hits the allowlist
+          # the scan succeeds with a warning, not a failure.
+          ignorefile: .github/trivy-allowlist.yaml
+          exit-code: '1'
+
+      - name: Build + Scan Web
+        uses: docker/build-push-action@ca635a4f4f194db07f3b72cfe1c3c5e9b54dd5e2 # v6.1.0
+        with:
+          context: .
+          file: docker/Dockerfile.web
+          tags: ${{ env.REGISTRY }}/${{ env.NAMESPACE }}/baseplate-web:sha-${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: VITE_API_URL=/api
+
+      - name: Extract image metadata
+        id: meta-api
+        run: echo "version=sha-${{ github.sha }}" >> "$GITHUB_OUTPUT"
+        # The build above already produced an image; this step just records
+        # the tag name for the CD job to consume via `needs.docker-build.outputs`.

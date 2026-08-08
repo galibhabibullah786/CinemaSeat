@@ -1,0 +1,88 @@
+// Prisma schema. Postgres 16.
+//
+// Convention: snake_case in the database (what a DBA expects), camelCase in
+// TypeScript (what the language expects). @map/@@map bridges the two so
+// neither side has to compromise.
+
+generator client {
+  provider = "prisma-client-js"
+
+  // Build engines for BOTH the host (npm install runs on Debian/Ubuntu CI)
+  // and the container (alpine:3.21, musl). The default `native` target only
+  // covers whichever platform the GENERATION ran on; without this list the
+  // service crashes on first query with "could not locate the Query Engine
+  // for runtime linux-musl-openssl-3.0.x".
+  binaryTargets = ["native", "linux-musl-openssl-3.0.x"]
+
+  // Explicit output, deliberately OUTSIDE src/ and dist/.
+  //
+  // Two problems this solves at once:
+  //   1. The default location is inside node_modules/.pnpm/<hashed dir>/, so a
+  //      `pnpm deploy --prod` reinstalls @prisma/client fresh and DISCARDS the
+  //      generated client. The container then starts fine and fails on its
+  //      first query with "@prisma/client did not initialize yet".
+  //   2. Generated code here is part of the package directory, so it is copied
+  //      by `pnpm deploy` like any other build output -- no regeneration (and
+  //      therefore no Prisma CLI) is needed in the runtime image.
+  //
+  // It must not live in src/: tsc would typecheck the .d.ts but never copy the
+  // .js to dist/. It must not live in dist/: `pnpm clean` would delete it.
+  // As a sibling of both, the relative import '../../generated/prisma/index.js'
+  // resolves identically from src/db/ and from dist/db/.
+  output = "../generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// >>> DEMO-DOMAIN:items -- removed by scripts/reset-domain.sh
+/// The disposable demo entity. Delete this model at the start of the hackathon.
+model Item {
+  id        String   @id @default(uuid()) @db.Uuid
+  name      String   @db.VarChar(200)
+  quantity  Int
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  // Keyset pagination reads (createdAt DESC, id DESC). The composite index
+  // matches the ORDER BY exactly, so Postgres can walk it instead of sorting.
+  // id is in the key to break ties deterministically -- two items created in
+  // the same millisecond would otherwise page unstably.
+  @@index([createdAt(sort: Desc), id(sort: Desc)])
+  @@map("items")
+}
+
+// <<< DEMO-DOMAIN:items
+
+/// Idempotency ledger. Generic on purpose: it survives `make reset-domain`
+/// and is the reference implementation the real domain copies tomorrow.
+///
+/// The uniqueness of (endpoint, key) is the ENFORCEMENT layer for "process
+/// this request at most once". It is enforced here, in the database, and not
+/// in the service, because only the database sees all concurrent transactions.
+/// A check-then-act in application code loses that race every time.
+model IdempotencyRecord {
+  /// Client-supplied Idempotency-Key header value.
+  key String @db.VarChar(255)
+
+  /// Logical operation, e.g. "POST /items". Scoping by endpoint stops the same
+  /// key on a different route from replaying an unrelated response.
+  endpoint String @db.VarChar(120)
+
+  /// SHA-256 of the canonical request body. A repeat of the SAME key with a
+  /// DIFFERENT body is a client bug and must be rejected, not replayed.
+  requestHash String @map("request_hash") @db.Char(64)
+
+  /// The original response, replayed verbatim on retry.
+  statusCode   Int    @map("status_code")
+  responseBody Json   @map("response_body")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  /// Retention sweep target. Idempotency records are not kept forever; see
+  /// docs/runbook.md. Without this index the cleanup becomes a seq scan.
+  @@id([endpoint, key])
+  @@index([createdAt])
+  @@map("idempotency_records")
+}

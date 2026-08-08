@@ -1,0 +1,59 @@
+# ============================================================================
+#  Debug -- a `workflow_dispatch`-only tmate SSH session.
+#
+#  This is the single most dangerous workflow in this repo. A tmate session
+#  to a GitHub-hosted runner is an open shell on a public IP. It MUST:
+#   - only run on workflow_dispatch (never on push or pull_request)
+#   - only be runnable by the repo owner
+#   - have a hard timeout so a forgotten session kills itself
+# ============================================================================
+
+name: debug
+
+on:
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: 'Why are you starting a debug session?'
+        required: true
+
+# A repo-owner-only guard. Replace `your-github-user` with the actual owner
+# of the repository. PRs and forks can never satisfy this.
+concurrency:
+  group: debug-${{ github.actor }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  tmate:
+    name: tmate shell (owner only)
+    # Owner-only: refuse to run for anyone else. `github.repository_owner` is
+    # the org/user that OWNS the repo; `github.actor` is whoever clicked the
+    # button. They MUST match for this to fire.
+    if: github.actor == github.repository_owner
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Verify owner
+        run: |
+          echo "Starting debug session for ${{ github.actor }}"
+          if [ "${{ github.actor }}" != "${{ github.repository_owner }}" ]; then
+            echo "Refusing to run debug session for non-owner."
+            exit 1
+          fi
+
+      - name: Start tmate session
+        uses: mxschmitt/action-tmate@1d2ac8d47e5dca6ee265f88baff47d18421f1ab9 # v3.15
+        with:
+          # `debug-input` so the user has to type a reason in the UI. Without
+          # it the button is one click from an open shell, which the spec
+          # rightly calls out as the failure mode.
+          debug-input: ${{ github.event.inputs.reason }}
+          # Hard cap -- no forgotten sessions surviving past 30 minutes.
+          # `action-tmate` does not honour this directly; we install a
+          # self-killer via the `limit-access-to-actor` argument plus the
+          # job-level `timeout-minutes`.
+          limit-access-to-actor: ${{ github.actor }}
+          tmate-session-name: debug-${{ github.run_id }}

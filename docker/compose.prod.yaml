@@ -1,0 +1,198 @@
+# Production-shaped stack. Run with `make prod` (which supplies -p and --env-file).
+#
+# The security properties this file is responsible for:
+#   - Postgres publishes NO port. It is reachable only from the internal network.
+#   - The API publishes NO port. The browser reaches it through nginx at /api/.
+#   - `backend` is `internal: true`, so nothing on it can reach the internet --
+#     an RCE in the API cannot phone home or pull a second-stage payload.
+#   - Only `web` is published, and it is the only service on both networks.
+#
+# Verify with: docker compose ... ps  and  scripts/verify-isolation.sh
+
+services:
+  # ---------------------------------------------------------------------------
+  db:
+    image: postgres:16.6-alpine@sha256:1d04b9ba1d4996401f2552b51beda8187f175c0645c091e4781134fc9c9a3eef
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER is required}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB is required}
+      # Without this, initdb picks a locale-dependent collation and two
+      # environments sort text differently -- which silently changes query
+      # results and index behaviour.
+      POSTGRES_INITDB_ARGS: '--encoding=UTF8 --locale=C'
+
+    # NO `ports:` -- deliberate, and load-bearing for acceptance criterion 4.
+    # To inspect the database, go through the container:
+    #   docker compose -f docker/compose.prod.yaml exec db psql -U <user> <db>
+
+    volumes:
+      # Named volume, not a bind mount. Survives `down` and `up`; destroyed
+      # only by `down -v` (see `make prune`).
+      - pgdata:/var/lib/postgresql/data
+
+    networks: [backend]
+
+    healthcheck:
+      # `depends_on: service_healthy` elsewhere is only as good as this probe.
+      # -U/-d are required: bare pg_isready checks the socket, not that THIS
+      # database is ready to accept queries.
+      test: ['CMD-SHELL', 'pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB" -q']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    # Postgres's entrypoint starts as root to fix ownership on the data volume
+    # and then drops to the postgres user. These are the capabilities that
+    # requires -- an empty cap set makes the container fail to initialise.
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID]
+
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+
+    logging: &logging
+      driver: json-file
+      options:
+        # Unbounded container logs fill the host disk and take the whole box
+        # down -- including the containers that were healthy.
+        max-size: '10m'
+        max-file: '3'
+
+  # ---------------------------------------------------------------------------
+  api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.api
+      target: runtime
+    image: ${GHCR_REGISTRY:-ghcr.io}/${GHCR_NAMESPACE:-local}/baseplate-api:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+
+    # tini as PID 1. Node handles SIGTERM itself (see src/shutdown.ts), but
+    # tini also reaps zombies -- a job PID 1 alone is responsible for, and
+    # which Node does not do.
+    init: true
+
+    environment:
+      NODE_ENV: production
+      API_PORT: 4000
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      APP_VERSION: ${IMAGE_TAG:-dev}
+      # Host is `db`, the compose service name, resolved on the internal
+      # network. Never localhost -- that is this container.
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}?schema=public&connection_limit=10&pool_timeout=10
+      # Same-origin in this topology: the browser only ever sees nginx's origin.
+      # Kept explicit so a future direct-access setup fails closed, not open.
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:8080}
+      BODY_LIMIT: ${BODY_LIMIT:-100kb}
+      RATE_LIMIT_WINDOW_MS: ${RATE_LIMIT_WINDOW_MS:-60000}
+      RATE_LIMIT_WRITE_MAX: ${RATE_LIMIT_WRITE_MAX:-60}
+      SHUTDOWN_TIMEOUT_MS: ${SHUTDOWN_TIMEOUT_MS:-10000}
+
+    # NO `ports:` -- criterion 4. Reachable only via nginx.
+
+    depends_on:
+      db:
+        # Not `service_started`. Postgres accepts TCP seconds before it accepts
+        # QUERIES; starting the API early means a burst of connection errors on
+        # every deploy.
+        condition: service_healthy
+
+    networks: [backend]
+
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+
+    logging: *logging
+
+  # ---------------------------------------------------------------------------
+  web:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.web
+      args:
+        # Relative path: the browser calls the same origin it loaded from, and
+        # nginx proxies /api/ to the API. This is what allows the API to stay
+        # unpublished while still being reachable from a browser.
+        VITE_API_URL: /api
+    image: ${GHCR_REGISTRY:-ghcr.io}/${GHCR_NAMESPACE:-local}/baseplate-web:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    init: true
+
+    ports:
+      # The ONLY published port in the stack.
+      - '${WEB_PORT:-8080}:8080'
+
+    depends_on:
+      api:
+        condition: service_healthy
+
+    # On BOTH networks: `frontend` to be published, `backend` to reach the API.
+    # This is the only service that bridges them.
+    networks: [frontend, backend]
+
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 128M
+
+    logging: *logging
+
+  # ---------------------------------------------------------------------------
+  # One-shot migration job. Behind a profile so it does NOT run on `up`.
+  #
+  # Applying migrations at container start is the failure mode this avoids:
+  # N replicas racing the same DDL, and a schema change happening at a moment
+  # nobody chose. Run it deliberately:
+  #     docker compose ... --profile migrate run --rm migrate
+  # which is what `make migrate` does.
+  migrate:
+    profiles: [migrate]
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.api
+      target: migrate
+    image: ${GHCR_REGISTRY:-ghcr.io}/${GHCR_NAMESPACE:-local}/baseplate-migrate:${IMAGE_TAG:-latest}
+    restart: 'no'
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}?schema=public
+    depends_on:
+      db:
+        condition: service_healthy
+    networks: [backend]
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    logging: *logging
+
+networks:
+  # Published entry point lives here.
+  frontend:
+    driver: bridge
+
+  # `internal: true` removes the gateway: containers here have NO route off the
+  # host. Postgres and the API cannot make outbound connections at all, which
+  # turns a remote-code-execution bug into a much less useful one.
+  backend:
+    driver: bridge
+    internal: true
+
+volumes:
+  pgdata:
+    driver: local

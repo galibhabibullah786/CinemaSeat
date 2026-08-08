@@ -1,0 +1,11 @@
+node_modules
+dist
+build
+coverage
+.turbo
+pnpm-lock.yaml
+playwright-report
+test-results
+*.tsbuildinfo
+apps/api/prisma/migrations
+temp

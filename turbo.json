@@ -1,0 +1,74 @@
+{
+  "$schema": "https://turbo.build/schema.json",
+  "ui": "stream",
+
+  // Anything listed here invalidates EVERY task's cache when it changes.
+  // Keep it short: over-listing here silently destroys cache hit rate.
+  "globalDependencies": [".env.example", ".nvmrc", "pnpm-lock.yaml"],
+
+  // Env vars that participate in cache keys globally. If a var changes the
+  // OUTPUT of a task it must be declared (globally or per-task) or Turbo will
+  // hand back a stale artifact built with a different value. This is the
+  // single most common Turborepo correctness bug.
+  "globalEnv": ["NODE_ENV", "CI"],
+
+  "tasks": {
+    "build": {
+      // A package cannot be built before the packages it consumes, because
+      // apps import the emitted .d.ts / .js from dist, not from src.
+      "dependsOn": ["^build"],
+      "inputs": [
+        "$TURBO_DEFAULT$",
+        "!**/*.test.ts",
+        "!**/*.test.tsx",
+        "!**/__tests__/**"
+      ],
+      "outputs": ["dist/**"],
+      // VITE_* is inlined into the web bundle at build time -> it is part of
+      // the artifact, therefore part of the cache key.
+      "env": ["VITE_API_URL"]
+    },
+
+    "typecheck": {
+      // Deviation from a "fully independent" typecheck: see docs/adr/0006.
+      // tsc needs the declaration files that ^build emits.
+      "dependsOn": ["^build"],
+      "outputs": []
+    },
+
+    "lint": {
+      // Genuinely independent: ESLint reads source, never build output.
+      "dependsOn": [],
+      "outputs": []
+    },
+
+    "test": {
+      "dependsOn": ["^build"],
+      "outputs": ["coverage/**"],
+      "env": ["DATABASE_URL", "TEST_DATABASE_URL"]
+    },
+
+    "test:unit": {
+      // Unit tests exercise the service layer with fakes: no build, no DB.
+      "dependsOn": [],
+      "outputs": ["coverage/**"]
+    },
+
+    "test:integration": {
+      "dependsOn": ["^build"],
+      "outputs": [],
+      "env": ["DATABASE_URL", "TEST_DATABASE_URL"],
+      // Talks to a real Postgres. Never serve a cached pass for this.
+      "cache": false
+    },
+
+    "dev": {
+      "cache": false,
+      "persistent": true
+    },
+
+    "clean": {
+      "cache": false
+    }
+  }
+}

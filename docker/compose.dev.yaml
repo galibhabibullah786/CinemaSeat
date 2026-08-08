@@ -1,0 +1,111 @@
+# Development stack. Run with `make dev`.
+#
+# Deliberately the OPPOSITE of compose.prod.yaml in the ways that matter for
+# iteration speed, and identical in the ways that matter for correctness:
+#   - source is bind-mounted and both apps hot reload
+#   - every port is published so you can attach psql, curl and a debugger
+#   - logs are verbose
+#   - the SAME Postgres image and the SAME schema as production
+#
+# What is NOT relaxed: the API still validates its environment, still runs the
+# real middleware stack, and still refuses to start on bad config. A dev stack
+# that skips those hides exactly the bugs it should surface.
+
+services:
+  db:
+    image: postgres:16.6-alpine@sha256:1d04b9ba1d4996401f2552b51beda8187f175c0645c091e4781134fc9c9a3eef
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-baseplate}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-baseplate_dev_only_change_me}
+      POSTGRES_DB: ${POSTGRES_DB:-baseplate}
+      POSTGRES_INITDB_ARGS: '--encoding=UTF8 --locale=C'
+    ports:
+      # Published in DEV ONLY, so you can run psql/pgAdmin/Prisma Studio from
+      # the host. compose.prod.yaml publishes nothing.
+      - '${POSTGRES_HOST_PORT:-5432}:5432'
+    volumes:
+      # A separate volume from prod's. Wiping your dev data must never be one
+      # typo away from wiping the data you are about to demo.
+      - pgdata_dev:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB" -q']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  api:
+    image: node:24-alpine@sha256:d32cdf619f63fe0471182d08996dd516c6275bb5fd31ae06e55a570bd9e1ad43
+    init: true
+    working_dir: /app
+    # Runs the source directly with tsx watch -- no build step in the loop.
+    # `corepack enable` each start because node_modules is a volume, not baked.
+    command: >
+      sh -c "corepack enable &&
+             pnpm install --frozen-lockfile &&
+             pnpm --filter @baseplate/contracts run build &&
+             pnpm --filter @baseplate/logger run build &&
+             pnpm --filter @baseplate/api exec prisma migrate deploy &&
+             pnpm --filter @baseplate/api run dev"
+    environment:
+      NODE_ENV: development
+      API_PORT: 4000
+      # Verbose by default in dev; this is where you want the noise.
+      LOG_LEVEL: ${LOG_LEVEL:-debug}
+      APP_VERSION: dev
+      DATABASE_URL: postgresql://${POSTGRES_USER:-baseplate}:${POSTGRES_PASSWORD:-baseplate_dev_only_change_me}@db:5432/${POSTGRES_DB:-baseplate}?schema=public
+      # The Vite dev server's origin must be allowed, or every request from the
+      # browser fails CORS and looks like a broken API.
+      CORS_ORIGINS: http://localhost:5173,http://localhost:8080
+      COREPACK_ENABLE_DOWNLOAD_PROMPT: '0'
+    ports:
+      - '${API_HOST_PORT:-4000}:4000'
+      # Node inspector. Attach a debugger to localhost:9229.
+      - '9229:9229'
+    volumes:
+      # Bind mount the repo so edits on the host are seen in the container.
+      - ..:/app
+      # Anonymous volumes MASK the host's node_modules directories. Without
+      # these, a host `pnpm install` (linux-x64 on your laptop, or macOS
+      # binaries) leaks into the container and native modules fail to load.
+      - /app/node_modules
+      - /app/apps/api/node_modules
+      - /app/packages/contracts/node_modules
+      - /app/packages/logger/node_modules
+    depends_on:
+      db:
+        condition: service_healthy
+
+  web:
+    image: node:24-alpine@sha256:d32cdf619f63fe0471182d08996dd516c6275bb5fd31ae06e55a570bd9e1ad43
+    init: true
+    working_dir: /app
+    command: >
+      sh -c "corepack enable &&
+             pnpm install --frozen-lockfile &&
+             pnpm --filter @baseplate/contracts run build &&
+             pnpm --filter @baseplate/web run dev --host 0.0.0.0"
+    environment:
+      # In dev the browser talks to the API directly on its published port --
+      # there is no nginx in this stack. This is the one place dev and prod
+      # differ in wiring, which is why CORS_ORIGINS above is not optional.
+      VITE_API_URL: http://localhost:${API_HOST_PORT:-4000}
+      # Docker bind mounts on some hosts do not deliver inotify events;
+      # polling is slower but is the difference between hot reload working
+      # and silently not working.
+      VITE_USE_POLLING: ${VITE_USE_POLLING:-true}
+      COREPACK_ENABLE_DOWNLOAD_PROMPT: '0'
+    ports:
+      - '5173:5173'
+    volumes:
+      - ..:/app
+      - /app/node_modules
+      - /app/apps/web/node_modules
+      - /app/packages/contracts/node_modules
+    depends_on:
+      - api
+
+volumes:
+  pgdata_dev:
+    driver: local

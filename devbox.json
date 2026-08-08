@@ -1,0 +1,25 @@
+{
+  "$schema": "https://raw.githubusercontent.com/jetify-com/devbox/0.17.5/.schema/devbox.schema.json",
+  "packages": [
+    "nodejs@24",
+    "act@latest",
+    "postgresql@16"
+  ],
+  "env": {
+    "PATH": "$PWD/.devbox/bin:$PATH"
+  },
+  "shell": {
+    "init_hook": [
+      "mkdir -p \"$PWD/.devbox/bin\"",
+      "corepack enable --install-directory \"$PWD/.devbox/bin\" >/dev/null 2>&1 || true",
+      "echo \"devbox: node $(node -v), pnpm $(pnpm -v 2>/dev/null) -- run 'make help'\""
+    ],
+    "scripts": {
+      "setup": ["make setup"],
+      "dev": ["make dev"],
+      "test": ["make test"],
+      "lint": ["make lint"],
+      "ci": ["make ci-local"]
+    }
+  }
+}

@@ -1,0 +1,231 @@
+# syntax=docker/dockerfile:1.10
+#
+# API image. Multi-stage, built from the REPOSITORY ROOT as context:
+#   docker build -f docker/Dockerfile.api .
+#
+# Layer strategy: manifests are copied and installed BEFORE any source, so
+# editing a .ts file reuses the cached dependency layer. That is the difference
+# between a 5-second rebuild and a 90-second one, ~50 times a day.
+
+# Pinned to a digest, not just a tag. A tag is mutable: `node:24-alpine` today
+# and next week are different images, which silently breaks reproducibility and
+# invalidates any vulnerability scan you did against "the same" tag.
+ARG NODE_IMAGE=node:24-alpine@sha256:d32cdf619f63fe0471182d08996dd516c6275bb5fd31ae06e55a570bd9e1ad43
+
+# =============================================================================
+# base -- pnpm available, nothing else
+# =============================================================================
+FROM ${NODE_IMAGE} AS base
+ENV PNPM_HOME=/pnpm \
+    PATH=/pnpm:$PATH \
+    # Stops corepack asking an interactive question in a non-interactive build.
+    COREPACK_ENABLE_DOWNLOAD_PROMPT=0
+# corepack reads `packageManager` from package.json, so the pnpm version is
+# pinned by the repo rather than by whatever the base image happens to ship.
+RUN corepack enable
+WORKDIR /app
+
+# =============================================================================
+# deps -- install with the lockfile only. Cached until a manifest changes.
+# =============================================================================
+FROM base AS deps
+
+# Only manifests and the lockfile. Copying source here would make every source
+# edit reinstall every dependency.
+COPY pnpm-lock.yaml pnpm-workspace.yaml package.json .npmrc ./
+COPY apps/api/package.json        apps/api/
+COPY packages/config/package.json packages/config/
+COPY packages/logger/package.json packages/logger/
+COPY packages/contracts/package.json packages/contracts/
+
+# --frozen-lockfile: fail if the lockfile does not match the manifests, rather
+# than silently resolving new versions inside a build nobody is watching.
+# The cache mount keeps the pnpm store between builds without putting it in a
+# layer (it would be dead weight in the final image).
+RUN --mount=type=cache,id=pnpm-store,target=/pnpm/store \
+    pnpm install --frozen-lockfile --filter @baseplate/api... --filter .
+
+# =============================================================================
+# build -- compile TypeScript and generate the Prisma client
+# =============================================================================
+FROM deps AS build
+
+COPY packages/config   packages/config
+COPY packages/contracts packages/contracts
+COPY packages/logger   packages/logger
+COPY apps/api          apps/api
+
+# Prisma's client is generated code: it must exist before tsc typechecks the
+# repository layer against it.
+RUN pnpm --filter @baseplate/api exec prisma generate \
+ && pnpm --filter @baseplate/contracts run build \
+ && pnpm --filter @baseplate/logger   run build \
+ && pnpm --filter @baseplate/api      exec tsc -p tsconfig.build.json
+
+# `pnpm deploy` materialises a self-contained directory: workspace deps are
+# copied in rather than symlinked out of the monorepo, so the runtime stage
+# needs nothing from /app. The generated Prisma client lives in
+# apps/api/generated/ (see schema.prisma) and is copied along with it, so the
+# runtime image never needs the Prisma CLI.
+RUN pnpm deploy --filter=@baseplate/api --prod /out
+
+# Drop source, type-only files and sourcemaps -- none are read at runtime.
+RUN rm -rf /out/src /out/tsconfig.json /out/eslint.config.js \
+ && find /out -name "*.map" -type f -delete \
+ && find /out -name "*.ts" -not -name "*.d.ts" -type f -delete \
+ # Prisma-generated client: the service uses the *native* libquery engine
+ # (libquery_engine-debian-openssl-3.0.x.so.node). The WASM engines and the
+ # edge/browser bundles are dead weight on Alpine Node.
+ # ~22MB of artifacts this service can never load.
+ && rm -f /out/generated/prisma/query_engine_bg.wasm \
+          /out/generated/prisma/query_engine_bg.js \
+          /out/generated/prisma/index-browser.js \
+          /out/generated/prisma/wasm.js \
+          /out/generated/prisma/wasm-worker-loader.mjs \
+          /out/generated/prisma/wasm-edge-light-loader.mjs \
+ # The runtime/ tree has both .js (CJS) and .mjs (ESM) variants of every
+ # entrypoint. The service is loaded as ESM (api/package.json: "type":"module")
+ # but the runtime condition resolves to .js via the exports map. The .mjs
+ # siblings are unreachable. Edge / browser / react-native entrypoints are
+ # also unreachable from a Node-on-Linux service. Strip them too.
+ && find /out/generated/prisma/runtime -name "*.mjs" -type f -delete \
+ && rm -f /out/generated/prisma/edge.js \
+          /out/generated/prisma/edge.d.ts \
+          /out/generated/prisma/react-native.js \
+          /out/generated/prisma/react-native.d.ts \
+          /out/generated/prisma/extension.js \
+          /out/generated/prisma/extension.d.ts \
+          /out/generated/prisma/runtime/edge.js \
+          /out/generated/prisma/runtime/edge-esm.js \
+          /out/generated/prisma/runtime/react-native.js \
+          /out/generated/prisma/runtime/index-browser.js \
+          /out/generated/prisma/runtime/wasm-engine-edge.js \
+          /out/generated/prisma/runtime/wasm-compiler-edge.js
+
+# Prune database engines this service can never load.
+#
+# @prisma/client ships a WebAssembly query engine AND a query compiler for
+# every database Prisma supports. This service talks to Postgres and nothing
+# else, so cockroachdb / mysql / sqlite / sqlserver are ~45MB of unreachable
+# code. Both families must be pruned -- pruning only `query_engine_bg.*` and
+# missing `query_compiler_bg.*` leaves half the weight behind.
+RUN set -eux; \
+    RT=$(echo /out/node_modules/.pnpm/@prisma+client@*/node_modules/@prisma/client/runtime); \
+    for engine in cockroachdb mysql sqlite sqlserver; do \
+      rm -f "$RT"/query_engine_bg.$engine.* "$RT"/query_compiler_bg.$engine.*; \
+    done; \
+    # Even the postgresql WASM engine is dead weight here: it exists for edge
+    # runtimes (Workers, Vercel Edge) that cannot dlopen a native library. This
+    # is Node on Alpine and it loads libquery_engine-linux-musl-*.so.node. The
+    # query COMPILER is likewise only used behind the `queryCompiler` preview
+    # flag, which is off.
+    rm -f "$RT"/query_engine_bg.postgresql.wasm-base64.* \
+          "$RT"/query_compiler_bg.postgresql.*; \
+    # The runtime/ tree inside @prisma/client also carries .mjs (ESM) siblings
+    # of every .js entrypoint, plus edge/browser/react-native entrypoints that
+    # are unreachable from a Node-on-Linux service. Same reasoning as the
+    # generated/prisma pruning above.
+    find "$RT" -name "*.mjs" -type f -delete; \
+    rm -f "$RT"/edge.js "$RT"/edge-esm.js "$RT"/react-native.js \
+          "$RT"/index-browser.js "$RT"/index-browser.mjs \
+          "$RT"/wasm-engine-edge.js "$RT"/wasm-compiler-edge.js; \
+    # Type declarations are a compile-time artifact. tsc already ran.
+    find /out -name "*.d.ts" -type f -delete; \
+    # .d.mts siblings of .d.ts are also unreachable from a runtime that never
+    # type-checks. Drop them too.
+    find /out -name "*.d.mts" -type f -delete; \
+    find /out -name "*.md" -o -name "LICENSE*" -o -name "*.flow" -type f | xargs -r rm -f
+
+# Build the SERVING tree here, in this stage, by copying /out and deleting the
+# Prisma CLI from the copy.
+#
+# This deletion MUST happen before the runtime stage's COPY, not after it.
+# Docker layers are additive: `RUN rm -rf` in the final stage only writes
+# whiteout entries, so the deleted bytes still ship inside the earlier COPY
+# layer and the image does not shrink by a single byte. Pruning on this side of
+# the stage boundary means the COPY never carries them at all.
+RUN cp -a /out /runtime \
+ && rm -rf /runtime/node_modules/.pnpm/prisma@* \
+           /runtime/node_modules/.pnpm/@prisma+engines@* \
+           /runtime/node_modules/.pnpm/@prisma+fetch-engine@* \
+           /runtime/node_modules/.pnpm/@prisma+config@* \
+           /runtime/node_modules/.pnpm/effect@* \
+           /runtime/node_modules/.pnpm/fast-check@* \
+           /runtime/node_modules/.pnpm/jiti@* \
+           /runtime/node_modules/.bin/prisma
+
+# =============================================================================
+# migrate -- the Prisma CLI, for `prisma migrate deploy` on release
+# =============================================================================
+# A SEPARATE image, not a flag on the serving one. The CLI plus its own
+# dependency tree (effect, @prisma/engines) is ~95MB, and the process that
+# serves traffic has no business carrying the tool that can rewrite the schema.
+# Least privilege applied to an artifact rather than to a role.
+#
+# Both images are built from the SAME /out and tagged with the same commit SHA,
+# so the migration that runs and the code that serves can never disagree.
+FROM ${NODE_IMAGE} AS migrate
+ENV NODE_ENV=production
+WORKDIR /app
+COPY --from=build --chown=node:node /out ./
+USER node
+# Exec form: this is a one-shot job and must forward signals so a cancelled
+# deploy does not leave a half-applied migration holding locks.
+ENTRYPOINT ["node", "node_modules/prisma/build/index.js", "migrate", "deploy"]
+
+# =============================================================================
+# runtime -- production dependencies and compiled output only
+# =============================================================================
+# Bare Alpine plus the Node BINARY, rather than the full node:24-alpine image.
+#
+# node:24-alpine has a 167MB root filesystem, of which ~43MB is npm, yarn and
+# corepack. A server that installs nothing at runtime needs none of them, and
+# shipping a package manager in a production container is free attack surface
+# (it is a ready-made downloader for anything that gets code execution).
+#
+# Copying the binary out of the official image keeps the exact, digest-pinned
+# Node build -- this is not a different or self-compiled Node. libstdc++ is the
+# one shared library the binary needs beyond musl.
+FROM alpine:3.21@sha256:56fa17d2a7e7f168a043a2712e63aed1f8543aeafdcee47c58dcffe38ed51099 AS runtime
+
+RUN apk add --no-cache libstdc++ \
+ # The official image's `node` user (uid 1000) does not exist on bare Alpine.
+ && addgroup -g 1000 node \
+ && adduser -u 1000 -G node -s /bin/sh -D node
+
+COPY --from=base /usr/local/bin/node /usr/local/bin/node
+
+ENV NODE_ENV=production \
+    API_PORT=4000 \
+    # Node's own hint that this is a container; keeps heap sizing sane.
+    NODE_OPTIONS=--enable-source-maps
+
+WORKDIR /app
+
+# The `node` user (uid 1000) already exists in the official image. Ownership is
+# set during COPY rather than with a later `chown -R`, which would duplicate
+# the entire tree into a second layer.
+# /runtime, not /out: the Prisma CLI was already removed on the build side.
+COPY --from=build --chown=node:node /runtime ./
+
+# Non-root. A container process that is root is one container-escape CVE away
+# from being root on the host, and nothing here needs privilege.
+USER node
+
+EXPOSE 4000
+
+# No curl or wget in a slim base -- and adding one just for a healthcheck grows
+# the image and the attack surface. Node 24 has global fetch, so the runtime we
+# already ship is the health probe.
+#
+# /health, not /ready: this is a LIVENESS check and must not fail because
+# Postgres is briefly down (that would restart every replica during a database
+# blip). compose uses /ready separately for dependency ordering.
+HEALTHCHECK --interval=10s --timeout=3s --start-period=15s --retries=3 \
+  CMD node -e "fetch('http://127.0.0.1:'+(process.env.API_PORT||4000)+'/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+
+# EXEC form, not shell form. The shell form runs `/bin/sh -c "node ..."`, which
+# makes the SHELL pid 1; it does not forward SIGTERM, so `docker stop` would
+# wait the full 10s and then SIGKILL, severing in-flight requests. See the long
+# note in apps/api/src/shutdown.ts.
+ENTRYPOINT ["node", "dist/main.js"]

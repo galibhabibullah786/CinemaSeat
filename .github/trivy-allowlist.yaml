@@ -1,0 +1,15 @@
+# ============================================================================
+#  Trivy vulnerability allowlist.
+#
+#  Why this exists: Trivy will flag HIGH/CRITICAL CVEs in transitive
+#  dependencies we cannot patch in the time budget of a hackathon. The right
+#  answer is "open an issue and track it" -- not "disable the scan". So this
+#  file documents the OUTSTANDING exceptions with a justification and an
+#  expiry, and the CI scan respects it.
+#
+#  Format: see https://github.com/aquasecurity/trivy/blob/main/docs/suppression.md
+#
+#  Rule: every entry MUST have an `expiry_date` within 30 days of opening.
+#  An entry past its expiry fails the scan. That is the discipline.
+# ============================================================================
+vulnerabilities: []
