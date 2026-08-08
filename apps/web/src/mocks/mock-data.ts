@@ -43,58 +43,58 @@ export const mockMovies: Movie[] = [
   },
 ];
 
-const today = new Date();
-const formattedToday = today.toISOString().split("T")[0];
-const tomorrow = new Date(today);
-tomorrow.setDate(today.getDate() + 1);
-const formattedTomorrow = tomorrow.toISOString().split("T")[0];
+export function createShowtimeDate(dayOffset: number, hours: number, minutes: number): string {
+  const date = new Date();
+  date.setDate(date.getDate() + dayOffset);
+  date.setHours(hours, minutes, 0, 0);
+  return date.toISOString();
+}
 
-export const mockShowtimes: Showtime[] = [
-  {
-    id: "st-dune-1",
-    movieId: "dune-part-two",
-    startsAt: `${formattedToday}T19:30:00.000Z`,
-    theatreName: "CinemaSeat Grand IMAX",
-    screenName: "Screen 1 (IMAX)",
-    priceCents: 1800,
-    currency: "USD",
-    availableSeats: 48,
-    totalSeats: 60,
-  },
-  {
-    id: "st-dune-2",
-    movieId: "dune-part-two",
-    startsAt: `${formattedToday}T22:15:00.000Z`,
-    theatreName: "CinemaSeat Grand IMAX",
-    screenName: "Screen 1 (IMAX)",
-    priceCents: 1800,
-    currency: "USD",
-    availableSeats: 52,
-    totalSeats: 60,
-  },
-  {
-    id: "st-interstellar-1",
-    movieId: "interstellar",
-    startsAt: `${formattedToday}T20:00:00.000Z`,
-    theatreName: "CinemaSeat Downtown",
-    screenName: "Screen 3",
-    priceCents: 1500,
-    currency: "USD",
-    availableSeats: 35,
-    totalSeats: 60,
-  },
-  {
-    id: "st-oppenheimer-1",
-    movieId: "oppenheimer",
-    startsAt: `${formattedTomorrow}T18:00:00.000Z`,
-    theatreName: "CinemaSeat Grand IMAX",
-    screenName: "Screen 2 70mm",
-    priceCents: 2000,
-    currency: "USD",
-    availableSeats: 20,
-    totalSeats: 60,
-  },
-];
+export function generateMockShowtimes(): Showtime[] {
+  const showtimes: Showtime[] = [];
+
+  const schedules = [
+    { offset: 0, times: [{ h: 14, m: 15 }, { h: 17, m: 30 }, { h: 20, m: 45 }] },
+    { offset: 1, times: [{ h: 15, m: 0 }, { h: 18, m: 15 }, { h: 21, m: 30 }] },
+    { offset: 2, times: [{ h: 14, m: 0 }, { h: 17, m: 15 }, { h: 20, m: 45 }] },
+    { offset: 3, times: [{ h: 13, m: 45 }, { h: 17, m: 0 }, { h: 20, m: 15 }] },
+  ];
+
+  const theatres = [
+    { name: "CinemaSeat Grand IMAX", screen: "Screen 1 (IMAX)", priceCents: 1800 },
+    { name: "CinemaSeat Downtown", screen: "Screen 3", priceCents: 1500 },
+    { name: "CinemaSeat Royal Palace", screen: "Screen 2 70mm", priceCents: 2000 },
+  ];
+
+  for (const movie of mockMovies) {
+    schedules.forEach(({ offset, times }) => {
+      times.forEach(({ h, m }, timeIndex) => {
+        const theatre = theatres[timeIndex % theatres.length]!;
+        let id = `st-${movie.id}-${offset}-${timeIndex + 1}`;
+        if (movie.id === "dune-part-two" && offset === 0 && timeIndex === 0) id = "st-dune-1";
+        if (movie.id === "dune-part-two" && offset === 0 && timeIndex === 1) id = "st-dune-2";
+        if (movie.id === "interstellar" && offset === 0 && timeIndex === 0) id = "st-interstellar-1";
+        if (movie.id === "oppenheimer" && offset === 1 && timeIndex === 0) id = "st-oppenheimer-1";
+
+        showtimes.push({
+          id,
+          movieId: movie.id,
+          startsAt: createShowtimeDate(offset, h, m),
+          theatreName: theatre.name,
+          screenName: theatre.screen,
+          priceCents: theatre.priceCents,
+          currency: "USD",
+          availableSeats: 48 - ((offset * 3 + timeIndex * 4) % 15),
+          totalSeats: 60,
+        });
+      });
+    });
+  }
+
+  return showtimes;
+}
+
+export const mockShowtimes: Showtime[] = generateMockShowtimes();
 
 export function createMockSeats(showtime: Showtime): Seat[] {
   const seats: Seat[] = [];

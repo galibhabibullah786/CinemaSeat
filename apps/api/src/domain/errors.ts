@@ -64,6 +64,15 @@ export class ConflictError extends AppError {
   }
 }
 
+export class SeatUnavailableError extends AppError {
+  readonly code = 'SEAT_UNAVAILABLE' as const;
+  readonly isClientError = true;
+
+  constructor(message = 'The requested seat is not available for hold.') {
+    super(message, 'This seat is unavailable or already held by another user.');
+  }
+}
+
 /**
  * A second request arrived for an Idempotency-Key that is already taken, and it
  * is not a safe replay -- either a different body, or the original is still

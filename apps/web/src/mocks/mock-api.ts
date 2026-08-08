@@ -11,14 +11,24 @@ import type {
   Showtime,
 } from "../api/types";
 import { ApiError } from "../api/types";
-import { mockMovies, mockShowtimes, createMockSeats } from "./mock-data";
+import { mockMovies, generateMockShowtimes, createMockSeats } from "./mock-data";
 
 const seatStore = new Map<string, Seat[]>();
 const bookingStore = new Map<string, Booking>();
 const otpStore = new Map<string, { phone: string; verified: boolean; sentAt: number }>();
 let refSequence = 2401;
 
-for (const showtime of mockShowtimes) seatStore.set(showtime.id, createMockSeats(showtime));
+function getMockShowtimes(): Showtime[] {
+  const showtimes = generateMockShowtimes();
+  for (const showtime of showtimes) {
+    if (!seatStore.has(showtime.id)) {
+      seatStore.set(showtime.id, createMockSeats(showtime));
+    }
+  }
+  return showtimes;
+}
+
+getMockShowtimes();
 
 const wait = (ms = 110) => new Promise<void>((resolve) => window.setTimeout(resolve, ms));
 const copySeats = (seats: Seat[]) => seats.map((seat) => ({ ...seat }));
@@ -30,7 +40,7 @@ const copyBooking = (booking: Booking): Booking => ({
 });
 
 function getShowtimeOrThrow(showtimeId: string): Showtime {
-  const showtime = mockShowtimes.find((item) => item.id === showtimeId);
+  const showtime = getMockShowtimes().find((item) => item.id === showtimeId);
   if (!showtime) throw new ApiError("That showtime is no longer available.", { status: 404 });
   return showtime;
 }
@@ -103,7 +113,7 @@ export const mockApi: CinemaApi = {
 
   async getShowtimes(movieId?: string) {
     await wait();
-    return mockShowtimes.filter((showtime) => !movieId || showtime.movieId === movieId).map((showtime) => ({ ...showtime }));
+    return getMockShowtimes().filter((showtime) => !movieId || showtime.movieId === movieId).map((showtime) => ({ ...showtime }));
   },
 
   async getShowtime(showtimeId: string) {

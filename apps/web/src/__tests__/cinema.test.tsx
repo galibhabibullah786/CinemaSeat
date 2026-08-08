@@ -1,16 +1,19 @@
 import { fireEvent, render, screen } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { describe, expect, it, vi } from "vitest";
 import type { Booking, Movie, Seat } from "../api/types";
 import { MAX_SEATS_PER_BOOKING } from "../api/types";
-import { mapBookingStatus, mapMovie, mapSeatMap } from "../api/cinema-api";
+import { cinemaApi, mapBookingStatus, mapMovie, mapSeatMap } from "../api/cinema-api";
 import { MovieCard } from "../pages/DiscoverPage";
+import MoviePage from "../pages/MoviePage";
 import { BookingStatusView } from "../pages/BookingPage";
 import { SeatButton } from "../features/seats/SeatMap";
 import { removeConflictingSeats, toggleSeatSelection } from "../features/seats/selection";
 import { secondsUntil } from "../lib/hooks";
 import { canStartPayment } from "../lib/booking";
 import { mockApi } from "../mocks/mock-api";
+import { toDateKey } from "../lib/format";
 
 const movie: Movie = { id: "m1", title: "Midnight Orbit", durationMinutes: 128, certificate: "PG-13", genres: ["Sci-fi"] };
 const available: Seat = { id: "A1", rowLabel: "A", seatNumber: 1, label: "A1", status: "AVAILABLE", priceCents: 1200 };
@@ -143,5 +146,42 @@ describe("CinemaSeat frontend contracts", () => {
     render(<MemoryRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}><BookingStatusView booking={{ ...baseBooking, status: "FAILED" }} /></MemoryRouter>);
     expect(screen.getByText("Payment not completed")).toBeVisible();
     expect(screen.getByRole("heading", { name: /payment was not completed/i })).toBeVisible();
+  });
+
+  it("returns at least 3 showtimes for today in mock mode for matching movie", async () => {
+    const showtimes = await mockApi.getShowtimes("dune-part-two");
+    const todayKey = toDateKey(new Date());
+    const todayShowtimes = showtimes.filter((st) => toDateKey(new Date(st.startsAt)) === todayKey);
+    expect(todayShowtimes.length).toBeGreaterThanOrEqual(3);
+    for (const st of todayShowtimes) {
+      expect(st.movieId).toBe("dune-part-two");
+    }
+  });
+
+  it("renders today's showtimes on MoviePage in mock mode", async () => {
+    vi.spyOn(cinemaApi, "getMovie").mockImplementation(mockApi.getMovie);
+    vi.spyOn(cinemaApi, "getShowtimes").mockImplementation(mockApi.getShowtimes);
+
+    try {
+      const queryClient = new QueryClient({
+        defaultOptions: { queries: { retry: false, gcTime: 0 } },
+      });
+
+      render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/movies/dune-part-two"]} future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
+            <Routes>
+              <Route path="/movies/:movieId" element={<MoviePage />} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>
+      );
+
+      const showtimePills = await screen.findAllByRole("link", { name: /left/i });
+      expect(showtimePills.length).toBeGreaterThanOrEqual(3);
+      expect(screen.queryByText(/no showtimes that day/i)).not.toBeInTheDocument();
+    } finally {
+      vi.restoreAllMocks();
+    }
   });
 });

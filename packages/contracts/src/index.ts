@@ -8,6 +8,4 @@
 export * from './errors.js';
 export * from './health.js';
 
-// >>> DEMO-DOMAIN:items -- removed by scripts/reset-domain.sh
-export * from './item.js';
-// <<< DEMO-DOMAIN:items
+export * from './cinema.js';
