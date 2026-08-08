@@ -168,6 +168,14 @@ FROM ${NODE_IMAGE} AS migrate
 ENV NODE_ENV=production
 WORKDIR /app
 COPY --from=build --chown=node:node /out ./
+# `pnpm deploy` honours apps/api/package.json's `files` field, which lists only
+# dist/, generated/ and package.json -- so prisma/schema.prisma and the
+# migrations/ directory are NOT in /out, and `migrate deploy` exits with
+# "Could not find Prisma Schema". They are copied here rather than added to
+# `files` so only THIS image carries them: the runtime image serves traffic
+# with the generated client and has no business shipping the schema that
+# rewrites the database.
+COPY --from=build --chown=node:node /app/apps/api/prisma ./prisma
 USER node
 # Exec form: this is a one-shot job and must forward signals so a cancelled
 # deploy does not leave a half-applied migration holding locks.

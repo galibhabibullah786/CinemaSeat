@@ -151,6 +151,11 @@ jobs:
           node-version-file: '.nvmrc'
           cache: 'pnpm'
       - run: pnpm install --frozen-lockfile
+      # Type-aware ESLint rules need the generated Prisma client for the same
+      # reason typecheck does: without it PrismaClient resolves to `error` and
+      # the rules report on types they cannot see. `^build` (turbo.json) covers
+      # the workspace .d.ts; only api's own generated client is left.
+      - run: pnpm --filter @baseplate/api exec prisma generate
       - run: pnpm run lint
 
   typecheck:
@@ -232,6 +237,11 @@ jobs:
       # with-test-db.sh runs `prisma migrate deploy` but never `generate`, so
       # the client the integration suite imports has to be generated here.
       - run: pnpm --filter @baseplate/api exec prisma generate
+      # `pnpm --filter ... run` (below) invokes the package script directly and
+      # never enters turbo, so `test:integration`'s declared `dependsOn:
+      # ["^build"]` does not fire and @baseplate/logger has no dist to resolve.
+      # `^...` selects api's dependencies without api itself.
+      - run: pnpm --filter "@baseplate/api^..." run build
       - run: bash scripts/with-test-db.sh pnpm --filter @baseplate/api run test:integration
 
   # --------------------------------------------------------------------------
@@ -256,7 +266,11 @@ jobs:
       - uses: actions/setup-node@8f152de45cc393bb48ce5d89d36b731f54556e65 # v4.0.0
         with:
           node-version-file: '.nvmrc'
-          cache: 'pnpm'
+          # Deliberately NO `cache: 'pnpm'`. This job never runs `pnpm install`,
+          # so the store directory is never created and the post-job cache save
+          # fails the whole job with "Path Validation Error: Path(s) specified
+          # in the action for caching do(es) not exist" -- after every real
+          # check has already passed.
 
       # `audit` resolves the lockfile against the advisory DB -- it does not
       # need node_modules, so this job skips `pnpm install` entirely.
@@ -395,20 +409,35 @@ jobs:
           tags: ${{ env.GHCR_REGISTRY }}/${{ env.GHCR_NAMESPACE }}/baseplate-api:sha-${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          provenance: true
-          sbom: true
+          # No provenance/sbom here, unlike CD. `load: true` uses the docker
+          # exporter, and attestations turn the result into an image index that
+          # the runner's classic image store cannot import ("docker exporter
+          # does not currently support exporting manifest lists"). This image
+          # exists only to be scanned and thrown away; the attested artifact is
+          # the one CD pushes.
+          provenance: false
+          sbom: false
           load: true
 
       - name: Scan API image
         uses: aquasecurity/trivy-action@6e7b7d1fd3e4fef0c5fa8cce1229c54b2c9bd0d8 # 0.24.0
+        env:
+          # Documented allowlist file for unpatchable transitive CVEs
+          # (see .github/trivy-allowlist.yaml). If a finding hits the allowlist
+          # the scan succeeds with a warning, not a failure.
+          #
+          # Passed as TRIVY_IGNOREFILE, NOT via the action's `trivyignores`
+          # input: that input concatenates the listed files into an
+          # extensionless `./trivyignores`, and Trivy picks the YAML parser by
+          # file extension -- so our `vulnerabilities:` document would be read
+          # as a flat list of CVE ids and silently match nothing. (`ignorefile`
+          # is not an input of this action at all; it was being dropped, which
+          # is why the allowlist has never actually applied.)
+          TRIVY_IGNOREFILE: .github/trivy-allowlist.yaml
         with:
           image-ref: ${{ env.GHCR_REGISTRY }}/${{ env.GHCR_NAMESPACE }}/baseplate-api:sha-${{ github.sha }}
           severity: HIGH,CRITICAL
           ignore-unfixed: true
-          # Documented allowlist file for unpatchable transitive CVEs
-          # (see .github/trivy-allowlist.yaml). If a finding hits the allowlist
-          # the scan succeeds with a warning, not a failure.
-          ignorefile: .github/trivy-allowlist.yaml
           exit-code: '1'
 
       - name: Build Web
