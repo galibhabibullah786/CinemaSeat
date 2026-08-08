@@ -10,7 +10,16 @@
 #  our secret context.
 #
 #  Path filter: a change that touches only apps/web does not run the API
-#  integration suite. The trade-off is documented in docs/adr/0007.
+#  integration suite. The per-scope skip keeps integration suite time off
+#  the critical path for frontend-only PRs.
+#
+#  SHA pinning: every third-party action is pinned to a full commit SHA, with
+#  the tag kept as a comment. See docs/adr/0004.
+#
+#  Image build vs push: the `docker-build` job builds (and scans) the images
+#  but does not push. CD pushes the same images with the same SHA tag.
+#  See docs/adr/0008 for the CI -> CD gating that decides when a build
+#  becomes a deploy.
 # ============================================================================
 
 name: ci
@@ -29,11 +38,15 @@ concurrency:
 permissions:
   contents: read
 
-# Fork PRs: skip secret-needing jobs. The `if:` conditions on those jobs
-# check `github.event.pull_request.head.repo.full_name == github.repository`
-# inline; an env variable holding the same expression is not reliable across
-# all parser variants.
+# Default-deny for fork-PRs: jobs that need secrets declare an inline
+# `if:` check on `github.event.pull_request.head.repo.full_name`.
+#
+# Image coordinates use the same names as .env.example / compose.prod.yaml so
+# the workflow and the deploy script agree on the variable names.
 
+env:
+  GHCR_REGISTRY: ghcr.io
+  GHCR_NAMESPACE: ${{ github.repository_owner }}
 
 jobs:
   # --------------------------------------------------------------------------
@@ -98,7 +111,7 @@ jobs:
     steps:
       - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
 
-      - uses: pnpm/action-setup@fe02b34f77f8bc703788d5817da081398fad5dd2 # v4.0.0
+      - uses: pnpm/action-setup@0c17529a66aca453f9227af23103ed11469b1e47 # v4.0.0
         with:
           version: 9.15.3
 
@@ -113,16 +126,9 @@ jobs:
       - name: Generate Prisma client
         run: pnpm --filter @baseplate/api exec prisma generate
 
-      - name: Cache pnpm store + node_modules
-        uses: actions/cache/save@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
-        with:
-          path: |
-            node_modules
-            ~/.local/share/pnpm/store
-          key: ${{ runner.os }}-pnpm-${{ hashFiles('pnpm-lock.yaml') }}-${{ github.sha }}
-          restore-keys: |
-            ${{ runner.os }}-pnpm-${{ hashFiles('pnpm-lock.yaml') }}-
-            ${{ runner.os }}-pnpm-
+      # setup-node's built-in `cache: 'pnpm'` already restores the pnpm store
+      # from the lockfile hash. The lockfile IS the cache key; pinning the
+      # key to github.sha would defeat PR reuse for no correctness gain.
 
   # --------------------------------------------------------------------------
   # 2. Quality gates in parallel. All depend on `setup`.
@@ -139,7 +145,7 @@ jobs:
         with:
           node-version-file: '.nvmrc'
           cache: 'pnpm'
-      - uses: pnpm/action-setup@fe02b34f77f8bc703788d5817da081398fad5dd2 # v4.0.0
+      - uses: pnpm/action-setup@0c17529a66aca453f9227af23103ed11469b1e47 # v4.0.0
         with: { version: 9.15.3 }
       - run: pnpm install --frozen-lockfile
       - run: pnpm run lint
@@ -156,7 +162,7 @@ jobs:
         with:
           node-version-file: '.nvmrc'
           cache: 'pnpm'
-      - uses: pnpm/action-setup@fe02b34f77f8bc703788d5817da081398fad5dd2 # v4.0.0
+      - uses: pnpm/action-setup@0c17529a66aca453f9227af23103ed11469b1e47 # v4.0.0
         with: { version: 9.15.3 }
       - run: pnpm install --frozen-lockfile
       - run: pnpm --filter @baseplate/api exec prisma generate
@@ -174,7 +180,7 @@ jobs:
         with:
           node-version-file: '.nvmrc'
           cache: 'pnpm'
-      - uses: pnpm/action-setup@fe02b34f77f8bc703788d5817da081398fad5dd2 # v4.0.0
+      - uses: pnpm/action-setup@0c17529a66aca453f9227af23103ed11469b1e47 # v4.0.0
         with: { version: 9.15.3 }
       - run: pnpm install --frozen-lockfile
       - run: pnpm --filter @baseplate/api exec prisma generate
@@ -205,6 +211,10 @@ jobs:
           --health-timeout 3s
           --health-retries 10
     env:
+      # with-test-db.sh detects the pre-set TEST_DATABASE_URL and skips
+      # starting a throwaway container; it still runs `prisma migrate deploy`
+      # and the test command for us, so the CI run is identical to
+      # `make test-integration` locally.
       TEST_DATABASE_URL: postgresql://test:test@localhost:5432/baseplate_test?schema=public
       DATABASE_URL: postgresql://test:test@localhost:5432/baseplate_test?schema=public
     steps:
@@ -213,11 +223,10 @@ jobs:
         with:
           node-version-file: '.nvmrc'
           cache: 'pnpm'
-      - uses: pnpm/action-setup@fe02b34f77f8bc703788d5817da081398fad5dd2 # v4.0.0
+      - uses: pnpm/action-setup@0c17529a66aca453f9227af23103ed11469b1e47 # v4.0.0
         with: { version: 9.15.3 }
       - run: pnpm install --frozen-lockfile
-      - run: pnpm --filter @baseplate/api exec prisma migrate deploy
-      - run: pnpm --filter @baseplate/api run test:integration
+      - run: bash scripts/with-test-db.sh pnpm --filter @baseplate/api run test:integration
 
   # --------------------------------------------------------------------------
   # 4. Security: dep audit, secret scan, filesystem scan.
@@ -274,7 +283,7 @@ jobs:
     steps:
       - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
 
-      - uses: pnpm/action-setup@fe02b34f77f8bc703788d5817da081398fad5dd2 # v4.0.0
+      - uses: pnpm/action-setup@0c17529a66aca453f9227af23103ed11469b1e47 # v4.0.0
         with: { version: 9.15.3 }
       - uses: actions/setup-node@8f152de45cc393bb48ce5d89d36b731f54556e65 # v4.0.0
         with:
@@ -320,10 +329,6 @@ jobs:
     permissions:
       contents: read
       packages: write    # to push to GHCR
-      id-token: write    # for cosign/keyless signing (future)
-    outputs:
-      api_sha_tag: ${{ steps.meta-api.outputs.version }}
-      web_sha_tag: ${{ steps.meta-web.outputs.version }}
     steps:
       - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
 
@@ -334,29 +339,30 @@ jobs:
       - name: Login to GHCR
         uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
         with:
-          registry: ${{ env.REGISTRY }}
+          registry: ${{ env.GHCR_REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Build the API image (not pushed here; the CD job pushes).
+      # The CI build is load-only (push:false by default). CD pushes the same
+      # images with the same SHA tag -- gating is at the workflow_run level,
+      # not at the build level. See docs/adr/0008.
       - name: Build API
-        id: build-api
         uses: docker/build-push-action@31159d49c0d4756269a0940a750801a1ea5d7003 # v6.1.0
         with:
           context: .
           file: docker/Dockerfile.api
           target: runtime
-          tags: ${{ env.REGISTRY }}/${{ env.NAMESPACE }}/baseplate-api:sha-${{ github.sha }}
+          tags: ${{ env.GHCR_REGISTRY }}/${{ env.GHCR_NAMESPACE }}/baseplate-api:sha-${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: true
           sbom: true
-          load: true   # so we can scan the just-built image
+          load: true
 
       - name: Scan API image
         uses: aquasecurity/trivy-action@6e7b7d1fd3e4fef0c5fa8cce1229c54b2c9bd0d8 # 0.24.0
         with:
-          image-ref: ${{ env.REGISTRY }}/${{ env.NAMESPACE }}/baseplate-api:sha-${{ github.sha }}
+          image-ref: ${{ env.GHCR_REGISTRY }}/${{ env.GHCR_NAMESPACE }}/baseplate-api:sha-${{ github.sha }}
           severity: HIGH,CRITICAL
           ignore-unfixed: true
           # Documented allowlist file for unpatchable transitive CVEs
@@ -365,18 +371,20 @@ jobs:
           ignorefile: .github/trivy-allowlist.yaml
           exit-code: '1'
 
-      - name: Build + Scan Web
+      - name: Build Web
         uses: docker/build-push-action@31159d49c0d4756269a0940a750801a1ea5d7003 # v6.1.0
         with:
           context: .
           file: docker/Dockerfile.web
-          tags: ${{ env.REGISTRY }}/${{ env.NAMESPACE }}/baseplate-web:sha-${{ github.sha }}
+          tags: ${{ env.GHCR_REGISTRY }}/${{ env.GHCR_NAMESPACE }}/baseplate-web:sha-${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           build-args: VITE_API_URL=/api
 
-      - name: Extract image metadata
-        id: meta-api
-        run: echo "version=sha-${{ github.sha }}" >> "$GITHUB_OUTPUT"
-        # The build above already produced an image; this step just records
-        # the tag name for the CD job to consume via `needs.docker-build.outputs`.
+      # Surface the immutable tag in the job log so the Actions UI can show
+      # which SHA was just scanned. CD reads `workflow_run.head_sha` directly
+      # and re-derives the short SHA itself; the CI job does not pass tags.
+      - name: Surface image tags
+        run: |
+          echo "API tag: sha-${{ github.sha }}"
+          echo "Web tag: sha-${{ github.sha }}"

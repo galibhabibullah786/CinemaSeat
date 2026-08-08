@@ -5,15 +5,21 @@ to the ADRs are in `[ADR-0001]` style.
 
 ## Deploy
 
-The CD pipeline is the intended path. It runs on every push to `main`
-after CI passes, and the `cd.yml` workflow can be re-run by hand.
+The CD pipeline is the intended path. It runs ONLY after a green CI on
+the same SHA — the `workflow_run` trigger on `cd.yml` fires when the
+`ci.yml` run completes successfully ([ADR-0008](adr/0008-ci-gates-cd.md)).
+A red CI silently skips CD; there is no deploy from a failing check.
+
+The `cd.yml` workflow can also be re-run by hand via `workflow_dispatch`
+for break-glass scenarios.
 
 ```bash
 # 1. Push to main.
 git push origin main
 
-# 2. Watch CI:    https://github.com/<owner>/<repo>/actions
+# 2. Watch CI:    https://github.com/<owner>/<repo>/actions/workflows/ci.yml
 # 3. Watch CD:    https://github.com/<owner>/<repo>/actions/workflows/cd.yml
+#    CD is auto-triggered only when CI is green.
 # 4. Confirm:     curl https://<your-host>/api/ready
 ```
 
@@ -73,6 +79,23 @@ If GitHub Actions is unavailable and the demo is in 30 minutes:
    intact.
 
 ## Common failures
+
+### 0. CD never started after a push to main
+
+Expected behaviour: CD is triggered by `workflow_run` on `ci.yml` and
+the gate requires `conclusion == 'success'` [ADR-0008]. Check
+`https://github.com/<owner>/<repo>/actions/workflows/ci.yml` for the
+commit's CI run.
+
+- If CI is red, fix the failing job and push. CD does not retry the
+  red run; a new push produces a new CI -> CD pair.
+- If CI is green but CD was skipped, the gate's condition failed (a
+  GitHub-side hiccup, not a code problem). Re-run `cd.yml` from the
+  Actions UI with `workflow_dispatch` — the gate explicitly allows it,
+  and the deploy uses the current `main` HEAD. The `tag` input can
+  pin to a specific short SHA.
+- If no CI run exists at all, the push did not land on `main`. CI does
+  not run on feature branches.
 
 ### 1. /ready returns 503 but /health is 200
 

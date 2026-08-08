@@ -27,7 +27,9 @@ docker/                  Dockerfiles + compose files. No application code here.
 docs/                    ADRs, runbook, standards.
 scripts/                 Shell scripts that are part of the developer workflow.
 .github/workflows/       CI, CD, debug.
-.agents/skills/          Domain-specific checklists for an LLM agent.
+.agents/skills/          Canonical skill bodies for an LLM agent.
+.claude/skills/          Claude frontmatter wrappers (one dir per
+                         skill; SKILL.md points at the .agents body).
 ```
 
 ## Commands
@@ -82,15 +84,34 @@ A change is done when:
 
 1. Read `.agents/AGENTS.md` (this file) for orientation.
 2. Read the relevant skill file in `.agents/skills/` BEFORE editing code.
+   At minimum, load `simplify` after every non-trivial change.
 3. Read ONLY the files you need for the current task.
 4. At each phase boundary, output a ≤10-line state summary.
 5. Match existing patterns. Consistency beats local cleverness.
 6. When in doubt, ask. Don't guess about boundaries between packages.
+7. If the user says "from now on / each time / whenever", that is an
+   `update-config` request — wire a hook in `.claude/settings.json`,
+   do not just remember to do it in this conversation.
 
 ## Skills
 
-- `.agents/skills/correctness-and-concurrency.md`
-- `.agents/skills/security.md`
-- `.agents/skills/performance-and-scale.md`
-- `.agents/skills/testing.md`
-- `.agents/skills/observability.md`
+Domain-specific checklists an LLM agent loads BEFORE editing code.
+Each canonical body lives in `.agents/skills/<name>.md`. The
+matching `.claude/skills/<name>/SKILL.md` is the Claude frontmatter
+wrapper that points at the body — DO NOT duplicate content between
+the two.
+
+- `.agents/skills/correctness-and-concurrency.md` — state machines,
+  transactions, idempotency, locks, queues, retries.
+- `.agents/skills/security.md` — auth, secrets, injection, supply chain.
+- `.agents/skills/performance-and-scale.md` — hot paths, N+1,
+  unbounded growth, p95 latency.
+- `.agents/skills/testing.md` — what test to write at which layer.
+- `.agents/skills/observability.md` — structured logs, traces, metrics.
+- `.agents/skills/simplify.md` — post-change review (reuse, quality,
+  efficiency). Run before declaring a non-trivial change done.
+- `.agents/skills/create-skill.md` — capture a recurring workflow as
+  a reusable skill. Two-file layout, frontmatter conventions.
+- `.agents/skills/update-config.md` — wire `.claude/settings.json`
+  hooks for "from now on / each time / whenever" behaviours. The
+  harness executes hooks; the LLM forgets.

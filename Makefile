@@ -12,8 +12,8 @@ SHELL := /bin/bash
 
 # Reject silent no-ops caused by a stray file named like a target.
 .PHONY: help setup dev dev-detached prod down logs test test-unit test-integration \
-        e2e lint typecheck build ci-local deploy migrate verify-isolation \
-        reset-domain clean prune ps
+        e2e lint typecheck build ci-local actionlint deploy migrate \
+        verify-isolation reset-domain clean prune ps
 
 # --- configuration -----------------------------------------------------------
 PROJECT      := baseplate
@@ -103,6 +103,12 @@ ci-local: ## Run the same gates CI runs, in the same order, locally
 	$(MAKE) build
 	$(MAKE) test
 	@echo "  local CI gates passed"
+
+actionlint: ## Lint .github/workflows/*.yml with actionlint
+	@command -v actionlint >/dev/null 2>&1 || { \
+		echo "actionlint not found. Install: 'go install github.com/rhysd/actionlint/cmd/actionlint@latest'"; \
+		exit 1; }
+	actionlint -no-color
 
 # --- deploy ------------------------------------------------------------------
 deploy: ## Deploy to the configured host (see docs/runbook.md); prefers the CD pipeline
