@@ -141,12 +141,15 @@ jobs:
     permissions: { contents: read }
     steps:
       - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+      # pnpm MUST be installed before setup-node: `cache: 'pnpm'` shells out
+      # to `pnpm store path` to locate the cache directory, so a setup-node
+      # that runs first fails with "Unable to locate executable file: pnpm".
+      - uses: pnpm/action-setup@0c17529a66aca453f9227af23103ed11469b1e47 # v4.0.0
+        with: { version: 9.15.3 }
       - uses: actions/setup-node@8f152de45cc393bb48ce5d89d36b731f54556e65 # v4.0.0
         with:
           node-version-file: '.nvmrc'
           cache: 'pnpm'
-      - uses: pnpm/action-setup@0c17529a66aca453f9227af23103ed11469b1e47 # v4.0.0
-        with: { version: 9.15.3 }
       - run: pnpm install --frozen-lockfile
       - run: pnpm run lint
 
@@ -158,12 +161,12 @@ jobs:
     permissions: { contents: read }
     steps:
       - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+      - uses: pnpm/action-setup@0c17529a66aca453f9227af23103ed11469b1e47 # v4.0.0
+        with: { version: 9.15.3 }
       - uses: actions/setup-node@8f152de45cc393bb48ce5d89d36b731f54556e65 # v4.0.0
         with:
           node-version-file: '.nvmrc'
           cache: 'pnpm'
-      - uses: pnpm/action-setup@0c17529a66aca453f9227af23103ed11469b1e47 # v4.0.0
-        with: { version: 9.15.3 }
       - run: pnpm install --frozen-lockfile
       - run: pnpm --filter @baseplate/api exec prisma generate
       - run: pnpm run typecheck
@@ -176,12 +179,12 @@ jobs:
     permissions: { contents: read }
     steps:
       - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+      - uses: pnpm/action-setup@0c17529a66aca453f9227af23103ed11469b1e47 # v4.0.0
+        with: { version: 9.15.3 }
       - uses: actions/setup-node@8f152de45cc393bb48ce5d89d36b731f54556e65 # v4.0.0
         with:
           node-version-file: '.nvmrc'
           cache: 'pnpm'
-      - uses: pnpm/action-setup@0c17529a66aca453f9227af23103ed11469b1e47 # v4.0.0
-        with: { version: 9.15.3 }
       - run: pnpm install --frozen-lockfile
       - run: pnpm --filter @baseplate/api exec prisma generate
       - run: pnpm --filter @baseplate/api run test:unit
@@ -219,13 +222,16 @@ jobs:
       DATABASE_URL: postgresql://test:test@localhost:5432/baseplate_test?schema=public
     steps:
       - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+      - uses: pnpm/action-setup@0c17529a66aca453f9227af23103ed11469b1e47 # v4.0.0
+        with: { version: 9.15.3 }
       - uses: actions/setup-node@8f152de45cc393bb48ce5d89d36b731f54556e65 # v4.0.0
         with:
           node-version-file: '.nvmrc'
           cache: 'pnpm'
-      - uses: pnpm/action-setup@0c17529a66aca453f9227af23103ed11469b1e47 # v4.0.0
-        with: { version: 9.15.3 }
       - run: pnpm install --frozen-lockfile
+      # with-test-db.sh runs `prisma migrate deploy` but never `generate`, so
+      # the client the integration suite imports has to be generated here.
+      - run: pnpm --filter @baseplate/api exec prisma generate
       - run: bash scripts/with-test-db.sh pnpm --filter @baseplate/api run test:integration
 
   # --------------------------------------------------------------------------
@@ -239,7 +245,21 @@ jobs:
     permissions: { contents: read }
     steps:
       - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+        with:
+          # gitleaks scans history; a depth-1 checkout would only ever see the
+          # tip commit and silently pass on a secret introduced earlier.
+          fetch-depth: 0
 
+      - uses: pnpm/action-setup@0c17529a66aca453f9227af23103ed11469b1e47 # v4.0.0
+        with: { version: 9.15.3 }
+
+      - uses: actions/setup-node@8f152de45cc393bb48ce5d89d36b731f54556e65 # v4.0.0
+        with:
+          node-version-file: '.nvmrc'
+          cache: 'pnpm'
+
+      # `audit` resolves the lockfile against the advisory DB -- it does not
+      # need node_modules, so this job skips `pnpm install` entirely.
       - name: pnpm audit
         run: pnpm audit --audit-level=high
 
@@ -290,8 +310,20 @@ jobs:
           node-version-file: '.nvmrc'
           cache: 'pnpm'
 
+      # The Playwright CLI ships inside @playwright/test, so the workspace has
+      # to be installed before `exec playwright` can resolve anything.
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
       - name: Install Playwright browsers
         run: pnpm --filter @baseplate/e2e exec playwright install --with-deps chromium
+
+      # `make prod` passes `--env-file .env` to docker compose, and .env is
+      # gitignored, so a fresh runner has no such file and compose aborts.
+      # .env.example carries CI-safe defaults; it is the same file `make setup`
+      # copies locally.
+      - name: Seed .env for compose
+        run: cp .env.example .env
 
       - name: Bring up the prod stack
         env:
@@ -324,7 +356,15 @@ jobs:
   docker-build:
     name: docker build + scan
     needs: [lint, typecheck, unit, integration, security, e2e]
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    # `integration` is path-gated, and GitHub skips a job whose dependency was
+    # skipped -- so a plain `needs` list silently skips the image build on any
+    # change that does not touch the API. `!cancelled()` opts back in, and the
+    # explicit failure check keeps the gate honest: skipped is fine, failed is
+    # not.
+    if: >
+      !cancelled()
+      && !contains(needs.*.result, 'failure')
+      && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
     permissions:
       contents: read
