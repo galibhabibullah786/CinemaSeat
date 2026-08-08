@@ -1,12 +1,21 @@
 # ============================================================================
 #  CD -- build & push to GHCR, deploy over SSH, migrate, poll /ready.
 #
-#  Trigger: push to main (after CI passes) and workflow_dispatch.
+#  Trigger: workflow_run on the `ci` workflow completing successfully, OR a
+#  manual dispatch. CD NEVER starts on a raw `push` -- doing so would race
+#  the CI workflow for the same SHA and could publish images from a commit
+#  whose checks had not finished yet. The `workflow_run` event fires AFTER
+#  the CI run has reached a terminal state, so a green CI is the single
+#  pre-requisite for a deploy.
 #
 #  Tagging: images are tagged with BOTH `sha-<short-sha>` (immutable, what we
 #  deploy) and `latest` (a convenience for local `docker compose pull`). The
 #  deploy references the SHA tag. `latest` MUST NOT be deployed -- rollback
 #  would be impossible because "latest" has moved.
+#
+#  Fork safety: workflow_run inherits the source workflow's trust boundary. A
+#  fork PR can never satisfy it because the `ci` workflow refuses to run the
+#  GHCR-needing jobs (see ci.yml).
 #
 #  Alternative deploy path: see `deploy-render` job (commented). Switch in
 #  minutes if the SSH target VM is unavailable.
@@ -15,51 +24,96 @@
 name: cd
 
 on:
-  push:
-    branches: [main]
+  # Primary path: CD runs only after CI is green on the same SHA.
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+  # Manual path: a human can still kick a deploy from the Actions UI.
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Override IMAGE_TAG (default: sha-<short>)'
+        description: 'Override IMAGE_TAG (default: sha-<short> of the SHA that triggered CI)'
         required: false
 
 concurrency:
   # Only ONE deploy runs at a time. A long deploy + a fast push must NOT
   # overlap; otherwise the second one wins the race and the first leaves a
   # half-migrated database behind.
-  group: cd-${{ github.ref }}
+  group: cd-${{ github.event.workflow_run.head_branch || github.ref }}
   cancel-in-progress: false
 
-permissions:
-  contents: read
-  packages: write
-  id-token: write
-
+# `workflow_run` runs in the context of the DEFAULT branch, so `github.ref`
+# is `refs/heads/main` even when the source workflow fired from a PR. We
+# resolve the head SHA and branch explicitly from the upstream run.
+#
+# Image coordinates use the same names as .env.example / compose.prod.yaml so
+# the workflow and the deploy script agree on the variable names.
 env:
-  REGISTRY: ghcr.io
-  NAMESPACE: ${{ github.repository_owner }}
+  GHCR_REGISTRY: ghcr.io
+  GHCR_NAMESPACE: ${{ github.repository_owner }}
 
 jobs:
+  # --------------------------------------------------------------------------
+  # 0. Gate. Decide whether CD is allowed to proceed based on the CI result.
+  #    A separate, near-empty job keeps the gate logic in one place and makes
+  #    the "why did CD skip?" answer obvious in the Actions UI.
+  # --------------------------------------------------------------------------
+  gate:
+    name: gate (CI must be green)
+    runs-on: ubuntu-latest
+    permissions: { contents: read }
+    # The `workflow_run` event fires for ALL terminal states (success,
+    # failure, cancelled). Only `success` advances; everything else exits
+    # with a skipped status that fails the downstream `needs` chain.
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success')
+    outputs:
+      head_sha: ${{ steps.resolve.outputs.head_sha }}
+      head_branch: ${{ steps.resolve.outputs.head_branch }}
+    steps:
+      - name: Resolve triggering SHA
+        id: resolve
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            HEAD_SHA="${{ github.sha }}"
+            HEAD_BRANCH="${GITHUB_REF#refs/heads/}"
+          else
+            HEAD_SHA="${{ github.event.workflow_run.head_sha }}"
+            HEAD_BRANCH="${{ github.event.workflow_run.head_branch }}"
+          fi
+          echo "head_sha=${HEAD_SHA}"        >> "$GITHUB_OUTPUT"
+          echo "head_branch=${HEAD_BRANCH}"  >> "$GITHUB_OUTPUT"
+          echo "Deploying branch=${HEAD_BRANCH} sha=${HEAD_SHA}"
+
   build-and-push:
     name: build + push images
+    needs: gate
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     outputs:
       sha_tag: ${{ steps.tag.outputs.sha }}
     steps:
-      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+      - name: Checkout triggering SHA
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+        with:
+          ref: ${{ needs.gate.outputs.head_sha }}
+          fetch-depth: 1
 
       - uses: docker/setup-buildx-action@988b5a0280414f521da01fcc63a27aeeb4b104db # v3.6.1
 
       - name: Login to GHCR
         uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
         with:
-          registry: ${{ env.REGISTRY }}
+          registry: ${{ env.GHCR_REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Compute short SHA
         id: tag
-        run: echo "sha=sha-$(echo ${{ github.sha }} | cut -c1-7)" >> "$GITHUB_OUTPUT"
+        run: echo "sha=sha-$(echo ${{ needs.gate.outputs.head_sha }} | cut -c1-7)" >> "$GITHUB_OUTPUT"
 
       - name: Build + push API
         uses: docker/build-push-action@31159d49c0d4756269a0940a750801a1ea5d7003 # v6.1.0
@@ -68,8 +122,8 @@ jobs:
           file: docker/Dockerfile.api
           target: runtime
           tags: |
-            ${{ env.REGISTRY }}/${{ env.NAMESPACE }}/baseplate-api:${{ steps.tag.outputs.sha }}
-            ${{ env.REGISTRY }}/${{ env.NAMESPACE }}/baseplate-api:latest
+            ${{ env.GHCR_REGISTRY }}/${{ env.GHCR_NAMESPACE }}/baseplate-api:${{ steps.tag.outputs.sha }}
+            ${{ env.GHCR_REGISTRY }}/${{ env.GHCR_NAMESPACE }}/baseplate-api:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: true
@@ -82,8 +136,8 @@ jobs:
           context: .
           file: docker/Dockerfile.web
           tags: |
-            ${{ env.REGISTRY }}/${{ env.NAMESPACE }}/baseplate-web:${{ steps.tag.outputs.sha }}
-            ${{ env.REGISTRY }}/${{ env.NAMESPACE }}/baseplate-web:latest
+            ${{ env.GHCR_REGISTRY }}/${{ env.GHCR_NAMESPACE }}/baseplate-web:${{ steps.tag.outputs.sha }}
+            ${{ env.GHCR_REGISTRY }}/${{ env.GHCR_NAMESPACE }}/baseplate-web:latest
           build-args: VITE_API_URL=/api
           cache-from: type=gha
           cache-to: type=gha,mode=max
@@ -97,58 +151,19 @@ jobs:
       name: production
       url: ${{ steps.ready.outputs.url }}
     steps:
-      # NOTE: pinned to a tag, not a SHA. Replace with the commit SHA from
-      # https://github.com/appleboy/ssh-action/commits/master before going to
-      # production. We were not able to fetch the registry in this sandbox.
+      # The remote runs the same scripts/deploy.sh the runbook points
+      # operators at. One deploy sequence, local and automated.
       - name: Deploy over SSH
-        uses: appleboy/ssh-action@v1.0.3
+        uses: appleboy/ssh-action@029f5b4aeeeb58fdfe1410a5d17f967dacf36262 # v1.0.3
         with:
           host: ${{ secrets.DEPLOY_HOST }}
           username: ${{ secrets.DEPLOY_USER }}
           key: ${{ secrets.DEPLOY_SSH_KEY }}
           script: |
             set -euo pipefail
-
-            cd /opt/baseplate   # path on the target VM
-
-            # .env lives on the host, never in the repo. The deploy script
-            # reads it via --env-file.
-            if [ ! -f .env ]; then
-              echo "FATAL: /opt/baseplate/.env missing on target" >&2
-              exit 1
-            fi
-
+            cd /opt/baseplate
             export IMAGE_TAG="${{ needs.build-and-push.outputs.sha_tag }}"
-
-            # Pull BEFORE stopping anything: a failed pull must not leave the
-            # site down.
-            docker compose -p baseplate-prod -f docker/compose.prod.yaml --env-file .env pull
-
-            # Apply migrations FIRST against the still-running old release so
-            # we don't take the site down on a destructive migration. The
-            # application is backward-compatible with the old schema by
-            # design (see docs/adr/0002).
-            docker compose -p baseplate-prod -f docker/compose.prod.yaml --env-file .env \
-              --profile migrate run --rm migrate
-
-            # Now bring the new release up.
-            docker compose -p baseplate-prod -f docker/compose.prod.yaml --env-file .env \
-              up -d --remove-orphans
-
-            # Wait until the public /ready probe is green. The deploy is NOT
-            # "done" when containers start; it is done when traffic works.
-            for attempt in $(seq 1 30); do
-              code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
-                http://127.0.0.1:8080/api/ready || true)
-              if [ "$code" = "200" ]; then
-                echo "healthy after ${attempt} attempts"
-                exit 0
-              fi
-              sleep 3
-            done
-
-            echo "DEPLOY FAILED: /ready did not return 200" >&2
-            exit 1
+            bash scripts/deploy.sh --pull
 
       - name: Record public URL
         id: ready

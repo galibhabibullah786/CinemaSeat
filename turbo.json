@@ -37,8 +37,15 @@
     },
 
     "lint": {
-      // Genuinely independent: ESLint reads source, never build output.
-      "dependsOn": [],
+      // NOT independent, despite the intuition that ESLint only reads source.
+      // The config enables type-aware rules (no-redundant-type-constituents,
+      // prefer-nullish-coalescing, the no-unsafe-* family), and those run the
+      // TypeScript checker. A cross-package import whose .d.ts is missing
+      // resolves to the `error` type, which downgrades real findings to
+      // "unsafe any" noise AND fires errors of its own -- so a lint that runs
+      // before ^build reports on types it could not see. Same reasoning as
+      // typecheck, docs/adr/0006.
+      "dependsOn": ["^build"],
       "outputs": []
     },
 

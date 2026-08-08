@@ -10,7 +10,16 @@
 #  our secret context.
 #
 #  Path filter: a change that touches only apps/web does not run the API
-#  integration suite. The trade-off is documented in docs/adr/0007.
+#  integration suite. The per-scope skip keeps integration suite time off
+#  the critical path for frontend-only PRs.
+#
+#  SHA pinning: every third-party action is pinned to a full commit SHA, with
+#  the tag kept as a comment. See docs/adr/0004.
+#
+#  Image build vs push: the `docker-build` job builds (and scans) the images
+#  but does not push. CD pushes the same images with the same SHA tag.
+#  See docs/adr/0008 for the CI -> CD gating that decides when a build
+#  becomes a deploy.
 # ============================================================================
 
 name: ci
@@ -29,11 +38,15 @@ concurrency:
 permissions:
   contents: read
 
-# Fork PRs: skip secret-needing jobs. The `if:` conditions on those jobs
-# check `github.event.pull_request.head.repo.full_name == github.repository`
-# inline; an env variable holding the same expression is not reliable across
-# all parser variants.
+# Default-deny for fork-PRs: jobs that need secrets declare an inline
+# `if:` check on `github.event.pull_request.head.repo.full_name`.
+#
+# Image coordinates use the same names as .env.example / compose.prod.yaml so
+# the workflow and the deploy script agree on the variable names.
 
+env:
+  GHCR_REGISTRY: ghcr.io
+  GHCR_NAMESPACE: ${{ github.repository_owner }}
 
 jobs:
   # --------------------------------------------------------------------------
@@ -98,7 +111,7 @@ jobs:
     steps:
       - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
 
-      - uses: pnpm/action-setup@fe02b34f77f8bc703788d5817da081398fad5dd2 # v4.0.0
+      - uses: pnpm/action-setup@0c17529a66aca453f9227af23103ed11469b1e47 # v4.0.0
         with:
           version: 9.15.3
 
@@ -113,16 +126,9 @@ jobs:
       - name: Generate Prisma client
         run: pnpm --filter @baseplate/api exec prisma generate
 
-      - name: Cache pnpm store + node_modules
-        uses: actions/cache/save@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
-        with:
-          path: |
-            node_modules
-            ~/.local/share/pnpm/store
-          key: ${{ runner.os }}-pnpm-${{ hashFiles('pnpm-lock.yaml') }}-${{ github.sha }}
-          restore-keys: |
-            ${{ runner.os }}-pnpm-${{ hashFiles('pnpm-lock.yaml') }}-
-            ${{ runner.os }}-pnpm-
+      # setup-node's built-in `cache: 'pnpm'` already restores the pnpm store
+      # from the lockfile hash. The lockfile IS the cache key; pinning the
+      # key to github.sha would defeat PR reuse for no correctness gain.
 
   # --------------------------------------------------------------------------
   # 2. Quality gates in parallel. All depend on `setup`.
@@ -135,13 +141,21 @@ jobs:
     permissions: { contents: read }
     steps:
       - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+      # pnpm MUST be installed before setup-node: `cache: 'pnpm'` shells out
+      # to `pnpm store path` to locate the cache directory, so a setup-node
+      # that runs first fails with "Unable to locate executable file: pnpm".
+      - uses: pnpm/action-setup@0c17529a66aca453f9227af23103ed11469b1e47 # v4.0.0
+        with: { version: 9.15.3 }
       - uses: actions/setup-node@8f152de45cc393bb48ce5d89d36b731f54556e65 # v4.0.0
         with:
           node-version-file: '.nvmrc'
           cache: 'pnpm'
-      - uses: pnpm/action-setup@fe02b34f77f8bc703788d5817da081398fad5dd2 # v4.0.0
-        with: { version: 9.15.3 }
       - run: pnpm install --frozen-lockfile
+      # Type-aware ESLint rules need the generated Prisma client for the same
+      # reason typecheck does: without it PrismaClient resolves to `error` and
+      # the rules report on types they cannot see. `^build` (turbo.json) covers
+      # the workspace .d.ts; only api's own generated client is left.
+      - run: pnpm --filter @baseplate/api exec prisma generate
       - run: pnpm run lint
 
   typecheck:
@@ -152,12 +166,12 @@ jobs:
     permissions: { contents: read }
     steps:
       - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+      - uses: pnpm/action-setup@0c17529a66aca453f9227af23103ed11469b1e47 # v4.0.0
+        with: { version: 9.15.3 }
       - uses: actions/setup-node@8f152de45cc393bb48ce5d89d36b731f54556e65 # v4.0.0
         with:
           node-version-file: '.nvmrc'
           cache: 'pnpm'
-      - uses: pnpm/action-setup@fe02b34f77f8bc703788d5817da081398fad5dd2 # v4.0.0
-        with: { version: 9.15.3 }
       - run: pnpm install --frozen-lockfile
       - run: pnpm --filter @baseplate/api exec prisma generate
       - run: pnpm run typecheck
@@ -170,12 +184,12 @@ jobs:
     permissions: { contents: read }
     steps:
       - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+      - uses: pnpm/action-setup@0c17529a66aca453f9227af23103ed11469b1e47 # v4.0.0
+        with: { version: 9.15.3 }
       - uses: actions/setup-node@8f152de45cc393bb48ce5d89d36b731f54556e65 # v4.0.0
         with:
           node-version-file: '.nvmrc'
           cache: 'pnpm'
-      - uses: pnpm/action-setup@fe02b34f77f8bc703788d5817da081398fad5dd2 # v4.0.0
-        with: { version: 9.15.3 }
       - run: pnpm install --frozen-lockfile
       - run: pnpm --filter @baseplate/api exec prisma generate
       - run: pnpm --filter @baseplate/api run test:unit
@@ -205,19 +219,30 @@ jobs:
           --health-timeout 3s
           --health-retries 10
     env:
+      # with-test-db.sh detects the pre-set TEST_DATABASE_URL and skips
+      # starting a throwaway container; it still runs `prisma migrate deploy`
+      # and the test command for us, so the CI run is identical to
+      # `make test-integration` locally.
       TEST_DATABASE_URL: postgresql://test:test@localhost:5432/baseplate_test?schema=public
       DATABASE_URL: postgresql://test:test@localhost:5432/baseplate_test?schema=public
     steps:
       - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+      - uses: pnpm/action-setup@0c17529a66aca453f9227af23103ed11469b1e47 # v4.0.0
+        with: { version: 9.15.3 }
       - uses: actions/setup-node@8f152de45cc393bb48ce5d89d36b731f54556e65 # v4.0.0
         with:
           node-version-file: '.nvmrc'
           cache: 'pnpm'
-      - uses: pnpm/action-setup@fe02b34f77f8bc703788d5817da081398fad5dd2 # v4.0.0
-        with: { version: 9.15.3 }
       - run: pnpm install --frozen-lockfile
-      - run: pnpm --filter @baseplate/api exec prisma migrate deploy
-      - run: pnpm --filter @baseplate/api run test:integration
+      # with-test-db.sh runs `prisma migrate deploy` but never `generate`, so
+      # the client the integration suite imports has to be generated here.
+      - run: pnpm --filter @baseplate/api exec prisma generate
+      # `pnpm --filter ... run` (below) invokes the package script directly and
+      # never enters turbo, so `test:integration`'s declared `dependsOn:
+      # ["^build"]` does not fire and @baseplate/logger has no dist to resolve.
+      # `^...` selects api's dependencies without api itself.
+      - run: pnpm --filter "@baseplate/api^..." run build
+      - run: bash scripts/with-test-db.sh pnpm --filter @baseplate/api run test:integration
 
   # --------------------------------------------------------------------------
   # 4. Security: dep audit, secret scan, filesystem scan.
@@ -230,7 +255,25 @@ jobs:
     permissions: { contents: read }
     steps:
       - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+        with:
+          # gitleaks scans history; a depth-1 checkout would only ever see the
+          # tip commit and silently pass on a secret introduced earlier.
+          fetch-depth: 0
 
+      - uses: pnpm/action-setup@0c17529a66aca453f9227af23103ed11469b1e47 # v4.0.0
+        with: { version: 9.15.3 }
+
+      - uses: actions/setup-node@8f152de45cc393bb48ce5d89d36b731f54556e65 # v4.0.0
+        with:
+          node-version-file: '.nvmrc'
+          # Deliberately NO `cache: 'pnpm'`. This job never runs `pnpm install`,
+          # so the store directory is never created and the post-job cache save
+          # fails the whole job with "Path Validation Error: Path(s) specified
+          # in the action for caching do(es) not exist" -- after every real
+          # check has already passed.
+
+      # `audit` resolves the lockfile against the advisory DB -- it does not
+      # need node_modules, so this job skips `pnpm install` entirely.
       - name: pnpm audit
         run: pnpm audit --audit-level=high
 
@@ -274,15 +317,27 @@ jobs:
     steps:
       - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
 
-      - uses: pnpm/action-setup@fe02b34f77f8bc703788d5817da081398fad5dd2 # v4.0.0
+      - uses: pnpm/action-setup@0c17529a66aca453f9227af23103ed11469b1e47 # v4.0.0
         with: { version: 9.15.3 }
       - uses: actions/setup-node@8f152de45cc393bb48ce5d89d36b731f54556e65 # v4.0.0
         with:
           node-version-file: '.nvmrc'
           cache: 'pnpm'
 
+      # The Playwright CLI ships inside @playwright/test, so the workspace has
+      # to be installed before `exec playwright` can resolve anything.
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
       - name: Install Playwright browsers
         run: pnpm --filter @baseplate/e2e exec playwright install --with-deps chromium
+
+      # `make prod` passes `--env-file .env` to docker compose, and .env is
+      # gitignored, so a fresh runner has no such file and compose aborts.
+      # .env.example carries CI-safe defaults; it is the same file `make setup`
+      # copies locally.
+      - name: Seed .env for compose
+        run: cp .env.example .env
 
       - name: Bring up the prod stack
         env:
@@ -315,15 +370,19 @@ jobs:
   docker-build:
     name: docker build + scan
     needs: [lint, typecheck, unit, integration, security, e2e]
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    # `integration` is path-gated, and GitHub skips a job whose dependency was
+    # skipped -- so a plain `needs` list silently skips the image build on any
+    # change that does not touch the API. `!cancelled()` opts back in, and the
+    # explicit failure check keeps the gate honest: skipped is fine, failed is
+    # not.
+    if: >
+      !cancelled()
+      && !contains(needs.*.result, 'failure')
+      && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write    # to push to GHCR
-      id-token: write    # for cosign/keyless signing (future)
-    outputs:
-      api_sha_tag: ${{ steps.meta-api.outputs.version }}
-      web_sha_tag: ${{ steps.meta-web.outputs.version }}
     steps:
       - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
 
@@ -334,49 +393,67 @@ jobs:
       - name: Login to GHCR
         uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
         with:
-          registry: ${{ env.REGISTRY }}
+          registry: ${{ env.GHCR_REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Build the API image (not pushed here; the CD job pushes).
+      # The CI build is load-only (push:false by default). CD pushes the same
+      # images with the same SHA tag -- gating is at the workflow_run level,
+      # not at the build level. See docs/adr/0008.
       - name: Build API
-        id: build-api
         uses: docker/build-push-action@31159d49c0d4756269a0940a750801a1ea5d7003 # v6.1.0
         with:
           context: .
           file: docker/Dockerfile.api
           target: runtime
-          tags: ${{ env.REGISTRY }}/${{ env.NAMESPACE }}/baseplate-api:sha-${{ github.sha }}
+          tags: ${{ env.GHCR_REGISTRY }}/${{ env.GHCR_NAMESPACE }}/baseplate-api:sha-${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          provenance: true
-          sbom: true
-          load: true   # so we can scan the just-built image
+          # No provenance/sbom here, unlike CD. `load: true` uses the docker
+          # exporter, and attestations turn the result into an image index that
+          # the runner's classic image store cannot import ("docker exporter
+          # does not currently support exporting manifest lists"). This image
+          # exists only to be scanned and thrown away; the attested artifact is
+          # the one CD pushes.
+          provenance: false
+          sbom: false
+          load: true
 
       - name: Scan API image
         uses: aquasecurity/trivy-action@6e7b7d1fd3e4fef0c5fa8cce1229c54b2c9bd0d8 # 0.24.0
-        with:
-          image-ref: ${{ env.REGISTRY }}/${{ env.NAMESPACE }}/baseplate-api:sha-${{ github.sha }}
-          severity: HIGH,CRITICAL
-          ignore-unfixed: true
+        env:
           # Documented allowlist file for unpatchable transitive CVEs
           # (see .github/trivy-allowlist.yaml). If a finding hits the allowlist
           # the scan succeeds with a warning, not a failure.
-          ignorefile: .github/trivy-allowlist.yaml
+          #
+          # Passed as TRIVY_IGNOREFILE, NOT via the action's `trivyignores`
+          # input: that input concatenates the listed files into an
+          # extensionless `./trivyignores`, and Trivy picks the YAML parser by
+          # file extension -- so our `vulnerabilities:` document would be read
+          # as a flat list of CVE ids and silently match nothing. (`ignorefile`
+          # is not an input of this action at all; it was being dropped, which
+          # is why the allowlist has never actually applied.)
+          TRIVY_IGNOREFILE: .github/trivy-allowlist.yaml
+        with:
+          image-ref: ${{ env.GHCR_REGISTRY }}/${{ env.GHCR_NAMESPACE }}/baseplate-api:sha-${{ github.sha }}
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
           exit-code: '1'
 
-      - name: Build + Scan Web
+      - name: Build Web
         uses: docker/build-push-action@31159d49c0d4756269a0940a750801a1ea5d7003 # v6.1.0
         with:
           context: .
           file: docker/Dockerfile.web
-          tags: ${{ env.REGISTRY }}/${{ env.NAMESPACE }}/baseplate-web:sha-${{ github.sha }}
+          tags: ${{ env.GHCR_REGISTRY }}/${{ env.GHCR_NAMESPACE }}/baseplate-web:sha-${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           build-args: VITE_API_URL=/api
 
-      - name: Extract image metadata
-        id: meta-api
-        run: echo "version=sha-${{ github.sha }}" >> "$GITHUB_OUTPUT"
-        # The build above already produced an image; this step just records
-        # the tag name for the CD job to consume via `needs.docker-build.outputs`.
+      # Surface the immutable tag in the job log so the Actions UI can show
+      # which SHA was just scanned. CD reads `workflow_run.head_sha` directly
+      # and re-derives the short SHA itself; the CI job does not pass tags.
+      - name: Surface image tags
+        run: |
+          echo "API tag: sha-${{ github.sha }}"
+          echo "Web tag: sha-${{ github.sha }}"
